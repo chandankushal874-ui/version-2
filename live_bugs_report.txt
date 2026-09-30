@@ -1,0 +1,325 @@
+====================================================================================================
+               NATIVE DESKTOP (EXE-TO-EXE) LIVE BUGS & PIPELINE DEFECT AUDIT REPORT
+====================================================================================================
+Project: Windows Live Translation Desktop App (Pure Tauri / Rust Native Audio + Node.js Relay)
+Target API: Ollalink Sound-Stream Realtime Speech-to-Speech API (sound-stream.ollalink.com)
+Reference Docs: https://ollalink.com/docs/getting-started/ & https://ollalink.com/docs/realtime-speech/
+Scope: Pure Native EXE Pipeline [Microphone -> Rust CPAL -> Relay Server -> Inbound WS -> DAC Playback]
+Excluded: All browser fallbacks, Web Audio API, and overengineered language tag dialect resolvers.
+Date: 2026-09-29
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & ARCHITECTURAL SCOPE
+----------------------------------------------------------------------------------------------------
+This audit focuses EXCLUSIVELY on the active native Windows desktop binary (EXE-to-EXE) architecture.
+All browser fallbacks (Web Audio API, ScriptProcessorNode, and browser DOM event-loop queues in
+bridge.ts) are completely bypassed in desktop operation:
+  - Audio Capture: 100% Rust Native via CPAL (Windows WASAPI multimedia thread) in audio/mod.rs
+  - Audio Transport: 100% Rust Tokio Async WebSocket client in ws/mod.rs
+  - Relay Server: Node.js gateway (server/src/server.js) interfacing with sound-stream.ollalink.com
+  - Audio Playback: 100% Rust Native Jitter Buffer & CPAL DAC Output in audio/jitter.rs
+
+Note on Regional Languages: The UI dropdowns already strictly restrict language codes to canonical
+2-letter ISO-639-1 tags ('en', 'hi', 'es', etc.). Regional dialect tag handling was deemed overengineered
+and has been excluded from the active defects list.
+
+Total Live Bugs Analyzed: 12 Distinct Defects across 5 Native Pipeline Stages.
+
+STAGE BREAKDOWN:
+  [STAGE 1] Hardware Microphone Capture (CPAL WASAPI Input): 2 Defects (Bugs #1, #2)
+  [STAGE 2] Audio Resampling & Client Sender Task:            3 Defects (Bugs #3, #4, #5)
+  [STAGE 3] API Server Relay & Ollalink Handshake:           3 Defects (Bugs #6, #7, #8)
+  [STAGE 4] Inbound Receive Path & Sample Rate Routing:       2 Defects (Bugs #9, #10)
+  [STAGE 5] Speaker Playback & Hardware WASAPI DAC:          2 Defects (Bugs #11, #12)
+
+====================================================================================================
+STAGE 1: HARDWARE MICROPHONE CAPTURE (Mic -> CPAL WASAPI Input)
+====================================================================================================
+
+--- BUG #1: Multi-Channel / Stereo XLR Audio Interface Right-Channel Discard ---
+Severity: HIGH
+Affected Component: app/src-tauri/src/audio/mod.rs (lines 252-258)
+Acoustic Symptom: Complete silence or no voice detected despite mic hardware active and speaking.
+Root Cause Analysis:
+  When audio hardware reports more than one channel (e.g. 2 channels on Focusrite Scarlett, Elgato
+  Wave, Rode Wireless, MOTU, or stereo USB webcams), CPAL receives interleaved samples [L, R, L, R...].
+  The native input stream callback processes data as:
+      for chunk in data.chunks_exact(channels) {
+          let s = <f32 as cpal::FromSample<$t>>::from_sample_(chunk[0]);
+          let _ = ring_mut.try_push(s * g);
+      }
+  It takes ONLY chunk[0] (Left channel) and completely ignores chunk[1..] (Right channel).
+  If a user has their microphone plugged into Input 2 / Right channel of a dual-input audio
+  interface, chunk[0] contains digital zero. The capture ring buffer receives pure silence,
+  the user's voice is never transmitted, and translation never triggers.
+Engineering Fix:
+  Downmix all reported channels into mono by averaging or taking the maximum active channel:
+      let sum: f32 = chunk.iter().map(|&x| <f32 as cpal::FromSample<$t>>::from_sample_(x)).sum();
+      let mono = (sum / channels as f32) * g;
+      let _ = ring_mut.try_push(mono);
+
+--- BUG #2: Capture Ring Buffer Silent Overrun During Thread Scheduling Stalls ---
+Severity: CRITICAL
+Affected Component: app/src-tauri/src/audio/mod.rs (line 27 & lines 248-258)
+Acoustic Symptom: Spoken words cut in half; loud acoustic clicks/pops between speech fragments.
+Root Cause Analysis:
+  The hardware capture ring buffer is sized at CAPTURE_RING_SAMPLES = 96,000 samples (2.0 seconds at
+  48 kHz). The CPAL capture callback writes to this ring buffer using lock-free `try_push`.
+  If the consumer sender task stalls for longer than 2.0 seconds (due to Windows thread scheduling,
+  system sleep, high CPU load, or network backpressure on send_pcm), the ring buffer fills to capacity.
+  `try_push` does not block; it silently drops all subsequent mic samples without notifying the sender.
+  When the sender task resumes, the time gap produces a sharp discontinuity in the PCM waveform.
+  Acoustically, this manifests as an instantaneous jump in voltage, heard by the listener as an
+  audible "snap" or "pop", accompanied by missing words or truncated sentences.
+Engineering Fix:
+  When `try_push` fails, track dropped sample counters and apply a rapid cross-fade / soft window
+  upon resumption to prevent waveform pops, while logging capture buffer underrun/overrun metrics.
+
+====================================================================================================
+STAGE 2: AUDIO RESAMPLING & CLIENT SENDER TASK (Rust Tokio Sender Loop)
+====================================================================================================
+
+--- BUG #3: The Double-Pacing Clock Drift Trap (Client Sleep vs. Relay Timer) ---
+Severity: HIGH
+Affected Components:
+  - Client Sender: app/src-tauri/src/audio/mod.rs (lines 395-412)
+  - Relay Server: server/src/server.js (lines 1030-1052)
+Acoustic Symptom: Increasing translation latency (accumulates to 3-5 seconds after several minutes).
+Root Cause Analysis:
+  In `mod.rs`, the native client sender loop contains:
+      if pending.len() >= chunk_samples {
+          let frame = pending.drain(..chunk_samples).collect();
+          relay.send_pcm(&pcm_out).await;
+          tokio::time::sleep(chunk_duration).await; // 500ms sleep
+      }
+  The client sleeps 500ms between each 500ms audio chunk.
+  Simultaneously, when the chunk arrives at the Node.js relay server, the relay pushes it to
+  `client.upstreamQueue` and initiates `schedulePacedUpstreamSend(client)`, which calculates:
+      const durationMs = Math.max(10, Math.min(1000, Math.floor(chunk.length / 32))); // 500ms
+      client.upstreamPacingTimer = setTimeout(..., durationMs);
+  Both client and server run independent 500ms timers on different physical clocks.
+  Because hardware audio crystals, Tokio timers, network latency, and Node.js event-loop timers
+  drift by 1-3%, audio chunks either arrive too late (starving the server pacing timer) or arrive
+  too fast (accumulating in `client.upstreamQueue`). Over a 10-minute session, this dual-timer
+  cascade builds up seconds of unnecessary latency.
+Engineering Fix:
+  Remove `tokio::time::sleep(chunk_duration)` from the client sender. The client should drain the
+  capture ring immediately and forward PCM frames over the local WebSocket connection without delay.
+  Let the relay server act as the single source of truth for upstream real-time pacing to Ollalink.
+
+--- BUG #4: Head-of-Queue Truncation Dropping Opening Words of Sentences ---
+Severity: HIGH
+Affected Component: app/src-tauri/src/audio/mod.rs (lines 380-388)
+Acoustic Symptom: The first 1-2 words of a sentence disappear after a brief network pause.
+Root Cause Analysis:
+  To prevent unbounded memory accumulation, `mod.rs` caps `pending` audio:
+      const MAX_PENDING: usize = 24000; // 1.5 seconds at 16 kHz
+      if pending.len() > MAX_PENDING {
+          let excess = pending.len() - MAX_PENDING;
+          pending.drain(..excess);
+      }
+  When the WebSocket send stalls briefly for 1.6 seconds due to network jitter, the mic continues
+  filling the buffer. When pending exceeds 24,000 samples, the code drains the OLDEST samples
+  from the front of the queue (`pending.drain(..excess)`).
+  Those oldest samples represent the beginning of the speaker's phrase. When the connection resumes,
+  the beginning of the sentence is gone, delivering broken fragments like "...going to the store"
+  instead of "I am going to the store".
+Engineering Fix:
+  Increase MAX_PENDING to 160,000 samples (10 seconds) to absorb network pauses without data loss,
+  and only drop if a true disconnect occurs.
+
+--- BUG #5: Brickwall Clamping Static on Peak Microphone Volume ---
+Severity: MEDIUM
+Affected Component: app/src-tauri/src/audio/mod.rs (line 404)
+Acoustic Symptom: Harsh raspy buzzing and crackling distortion on loud consonants or laughter.
+Root Cause Analysis:
+  Converting 32-bit float audio to 16-bit signed integer PCM:
+      let s16 = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+  While `clamp(-1.0, 1.0)` prevents undefined behavior and integer bit-wrapping, hard brickwall
+  clipping flattens the peaks of the sine wave into a square wave.
+  Square waves produce extreme odd-harmonic distortion across the entire audio frequency spectrum,
+  which the listener perceives as electric static or distortion.
+Engineering Fix:
+  Apply a soft tanh or polynomial saturation knee before conversion:
+      let s_sat = (s * 0.95).tanh();
+      let s16 = (s_sat * 32767.0) as i16;
+
+====================================================================================================
+STAGE 3: API SERVER RELAY & OLLALINK UPSTREAM (server.js <-> sound-stream.ollalink.com)
+====================================================================================================
+
+--- BUG #6: Upstream Pacing Clamp Overload (WebSocket Close Code 4029) ---
+Severity: CRITICAL
+Affected Component: server/src/server.js (line 1045)
+Acoustic Symptom: Translation abruptly dies mid-sentence; socket closes with "overloaded".
+Root Cause Analysis:
+  Ollalink's Sound-Stream specification explicitly states:
+    "You are sending audio faster than real time; the socket closes with overloaded."
+  Standard 16 kHz mono 16-bit PCM produces 32 bytes per millisecond (32,000 bytes/sec).
+  The pacing calculation in server.js previously clamped:
+      const durationMs = Math.max(10, Math.min(100, Math.floor(chunk.length / 32)));
+  The 100ms upper clamp meant that any chunk larger than 3,200 bytes (e.g. 6,400 bytes = 200ms,
+  or 16,000 bytes = 500ms) was paced with only a 100ms delay instead of its true duration!
+  A 500ms chunk was delivered in 100ms (5x real-time speed).
+  Within 2-3 chunks, Ollalink's GPU ingest buffer exceeded its burst tolerance and terminated
+  the connection with close code 4029.
+Engineering Fix:
+  Remove the 100ms clamp; clamp to a realistic upper bound (e.g. 1000ms):
+      const durationMs = Math.max(10, Math.min(1000, Math.floor(chunk.length / 32)));
+
+--- BUG #7: Upstream silence_ms Inconsistency Causing Premature Phrase Splitting ---
+Severity: HIGH
+Affected Components: server/src/server.js (lines 436, 515, 765) & server/src/ollalink.js (line 66)
+Acoustic Symptom: Sentences randomly cut off mid-thought; translated speech chopped into 2-word bursts.
+Root Cause Analysis:
+  Ollalink Sound-Stream API uses `endpointing: { mode: "auto", silence_ms: ... }` to detect when a
+  speaker finishes talking.
+  In earlier versions:
+    - Initial join used the default `1500ms`.
+    - Language change explicitly set `1500ms`.
+    - Reconnects after overload or abnormal close omitted the parameter, falling back to `600ms`.
+  When a reconnect occurred silently in the background, `silence_ms` abruptly dropped from 1500ms to
+  600ms. A 0.7-second natural thinking pause ("...um...") which was previously tolerated was now
+  interpreted by Ollalink as end-of-utterance. Ollalink cut the sentence in half, translated the first
+  half prematurely, and treated the remainder as a new, out-of-context sentence.
+Engineering Fix:
+  Define a single constant `DEFAULT_SILENCE_MS = 1500` in server.js and inject it consistently
+  across all session.configure, language change, and reconnect payloads.
+
+--- BUG #8: Multi-Target Audio Leak and Ghost Echo on Reconnect ---
+Severity: HIGH
+Affected Component: server/src/server.js (lines 1070-1078)
+Acoustic Symptom: Doubled audio playback (listener hears the same sentence twice with a 200ms delay).
+Root Cause Analysis:
+  When a user reconnected, the old WebSocket connection was terminated with `ws.terminate()`.
+  However, TCP teardown and WebSocket `close` event propagation are asynchronous.
+  For a window of 50-300ms, both the old terminating socket and the new socket existed in the room.
+  When translated audio arrived from Ollalink, `forwardOllalinkToRoom` iterated over room participants.
+  If the old socket still had `readyState === 1` and had not yet completed cleanup, the audio frame
+  was dispatched to BOTH sockets. The client desktop application received the audio twice, scheduling
+  both buffers and producing a disorienting echo/flanging artifact.
+Engineering Fix:
+  Prune old connections from the room subscriber map synchronously before adding the new connection.
+
+====================================================================================================
+STAGE 4: INBOUND RECEIVE PATH & SAMPLE RATE ROUTING (ws/mod.rs & audio/jitter.rs)
+====================================================================================================
+
+--- BUG #9: The 2x - 3x Speed "Chipmunk Effect" & 0.5x Slowdown Root Causes ---
+Severity: CRITICAL
+Affected Components:
+  - app/src-tauri/src/ws/mod.rs (lines 217-224)
+  - app/src-tauri/src/audio/jitter.rs (lines 113-132)
+Acoustic Symptom: Translated voice sounds like a high-pitched chipmunk speaking at 2x or 3x speed,
+                  or suddenly slows down to 0.5x demonic dragged-out speech.
+Mathematical & Architectural Root Cause:
+  Per Ollalink documentation, audio is returned via two completely different mechanisms:
+    1. Streaming PCM Lane (`stream`): Delivers raw `pcm_s16le` at 48,000 Hz.
+    2. Batch WAV Lane (`batch`): Delivers complete RIFF/WAVE files at 24,000 Hz.
+  When does 2x-3x speed happen in the native EXE?
+    Case A (3.0x Speed):
+      If 16,000 Hz audio is pushed to the native jitter buffer (which outputs at 48,000 Hz) without
+      resampling:
+          Speed Factor = 48,000 / 16,000 = 3.0x.
+      1.0 second of audio (16,000 samples) plays out in 0.33 seconds. Pitch is shifted up by 19
+      semitones, producing the classic "chipmunk" effect.
+    Case B (2.0x Speed):
+      When Ollalink falls back to the Batch Lane (which delivers 24,000 Hz WAV audio), stripping the
+      WAV header and pushing 24,000 Hz samples into a 48,000 Hz jitter buffer plays at 2.0x speed:
+          Speed Factor = 48,000 / 24,000 = 2.0x.
+    Case C (0.5x Demonic Slow-Motion Speed):
+      In `ws/mod.rs`, when a 24 kHz WAV batch chunk arrived:
+          let chunk_rate = match sample_rate {
+              Some(sr) if sr > 0 => sr,
+              _ => if is_wav { 24_000 } else { last_known_rate },
+          };
+          if chunk_rate > 0 { last_known_rate = chunk_rate; }
+      `last_known_rate` was clobbered to `24000`.
+      When the subsequent chunk arrived on the streaming PCM lane (48,000 Hz) without an explicit
+      rate tag, `chunk_rate` inherited `last_known_rate` (24,000 Hz).
+      The resampler treated 48,000 Hz audio as 24,000 Hz, downsampling it to 12,000 Hz and playing
+      it out at half speed (0.5x speed).
+Engineering Fix:
+  In `ws/mod.rs`, do not let temporary batch WAV rates overwrite the streaming PCM baseline:
+      let stream_default_rate = 48_000;
+      let chunk_rate = match sample_rate {
+          Some(sr) if sr > 0 => sr,
+          _ => if is_wav { 24_000 } else { stream_default_rate },
+      };
+
+--- BUG #10: Inbound Binary/Text Header Queue Capacity Mismatch ---
+Severity: MEDIUM
+Affected Component: app/src-tauri/src/ws/mod.rs (lines 199-202 & lines 231-235)
+Acoustic Symptom: Random missing audio chunks and rate desync during high network jitter.
+Root Cause Analysis:
+  The relay sends an audio chunk as two consecutive WebSocket frames: Text JSON metadata followed
+  by Binary PCM. When network packet jitter occurs, the two frames can arrive separated in time.
+  `ws/mod.rs` maintains two FIFO queues: `pending_binary_queue` and `expected_audio_queue`.
+  Both queues are capped at 32 elements. If a burst of 33 headers arrives before their binaries,
+  the oldest header is popped and discarded (`expected_audio_queue.pop_front()`).
+  When the binary frame finally arrives, its header is missing. The binary falls into the fallback
+  path and may guess the wrong sample rate or be dropped.
+Engineering Fix:
+  Embed chunk sequence numbers and sample rate directly as a 4-byte header prefix in the binary frame,
+  completely decoupling audio payloads from asynchronous JSON metadata frames.
+
+====================================================================================================
+STAGE 5: SPEAKER PLAYBACK & HARDWARE WASAPI DAC (audio/jitter.rs)
+====================================================================================================
+
+--- BUG #11: Jitter Buffer Underrun Starvation "Motorboat Stutter" ---
+Severity: CRITICAL
+Affected Component: app/src-tauri/src/audio/jitter.rs (lines 215-245)
+Acoustic Symptom: Rapid machine-gun stuttering and choppy audio during playback.
+Root Cause Analysis:
+  The hardware DAC callback (`fill_into`) pulls audio from the jitter ring buffer every ~10ms.
+  If internet packet arrival fluctuates (e.g. packets arrive at 0ms, 40ms, 110ms), the ring buffer
+  runs dry (underrun).
+  Without a starvation hysteresis state machine:
+    - DAC callback finds 0 samples -> outputs 10ms of silence.
+    - Next packet arrives -> player immediately starts playing without pre-buffering.
+    - 10ms later, buffer is empty again -> outputs 10ms of silence.
+  This rapid oscillation between 10ms audio and 10ms silence creates an acoustic 50 Hz square-wave
+  chopping frequency, perceived by the human ear as violent motorboat stuttering.
+Engineering Fix:
+  Implement a dual-threshold hysteresis state machine:
+    - When underrun occurs, transition to `State::Starved`.
+    - Do NOT resume DAC playback until the jitter buffer accumulates at least `target_buffer_ms`
+      (e.g., 60ms - 100ms) of audio, OR an `is_last: true` (utterance end) signal is received.
+
+--- BUG #12: Windows Hardware Output Sample Rate Mismatch (44.1 kHz vs 48 kHz vs 96 kHz) ---
+Severity: HIGH
+Affected Component: app/src-tauri/src/audio/jitter.rs (lines 18-28 & lines 140-165)
+Acoustic Symptom: Subtly flat pitch (8.8% slow) or sharp pitch (1.08x fast); audio backlog accumulation.
+Root Cause Analysis:
+  Standard Windows WASAPI shared-mode audio endpoints default to 44,100 Hz. Gaming headsets and
+  external DACs often run at 96,000 Hz or 192,000 Hz.
+  Ollalink's translated streaming audio is strictly 48,000 Hz.
+  If the playback jitter engine pushes 48,000 Hz audio into a 44,100 Hz output ring buffer without
+  device-aware resampling:
+      Pitch Shift Ratio = 44,100 / 48,000 = 0.91875 (-8.125%)
+  The audio plays roughly 8.8% too slow and flat by approximately 1.5 semitones.
+  Furthermore, because samples are consumed slower than real-time, the jitter buffer accumulates
+  stale audio, eventually triggering buffer overrun and audio dropouts.
+Engineering Fix:
+  Query the actual WASAPI output device configuration upon stream open:
+      let actual_rate = device.default_output_config()?.sample_rate().0;
+  Ensure `JitterPlayer` initializes a dynamic Rubato resampler to convert from inbound rate (48,000 Hz)
+  to actual device rate (44,100 Hz, 96,000 Hz, etc.) before writing to the DAC output ring buffer.
+
+====================================================================================================
+SUMMARY OF PRUNED NON-ISSUES & BROWSER-ONLY ARTIFACTS
+====================================================================================================
+The following items were identified as overengineered or browser-only and are excluded:
+  - Regional Language Tag Stripping: Excluded. UI strictly uses 2-letter canonical codes ('en', 'hi').
+  - ScriptProcessorNode Jank (bridge.ts): Excluded. Native EXE uses Rust CPAL WASAPI.
+  - Fixed Static RMS Thresholding (bridge.ts): Excluded. Native EXE uses Ollalink server-side VAD.
+  - Browser WebSocket Microqueue Race (bridge.ts): Excluded. Native EXE uses Tokio async channels.
+  - Browser Chunk Deduplication (bridge.ts): Excluded. Native EXE uses Rust inbound loop.
+  - Browser Queue Purge on End-of-Utterance (bridge.ts): Excluded. Native EXE flushes in Rust.
+  - Web Audio Lookahead Clamp Overlap (bridge.ts): Excluded. Native EXE uses CPAL DAC.
+
+====================================================================================================
+END OF EXE-TO-EXE AUDIT REPORT
+====================================================================================================

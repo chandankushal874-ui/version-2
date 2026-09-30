@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: ollalink-translate-relay
+    env: node
+    plan: free
+    region: oregon
+    rootDir: server
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/bootstrap.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: PUBLIC_BASE
+        value: https://windows-live-translation-app-1.onrender.com
+      - key: OLLALINK_KEY
+        sync: false
+      - key: OLLALINK_WS_URL
+        value: wss://sound-stream.ollalink.com/v1/speech/stream
+      - key: MAX_PARTICIPANTS
+        value: 4

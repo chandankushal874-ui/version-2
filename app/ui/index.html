@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ollalink Translate — 1:1 Voice Translation</title>
+  <link rel="stylesheet" href="/src/ui.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Top Navigation Bar -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-logo">
+          <span class="logo-dot"></span>
+          <span class="brand-title">Ollalink <strong>Translate</strong></span>
+        </div>
+        <span class="brand-badge">1:1 Realtime Speech</span>
+      </div>
+      <div class="header-right">
+        <span id="conn-status" class="pill pill-idle">idle</span>
+      </div>
+    </header>
+
+    <!-- LANDING VIEW (Pre-call) -->
+    <section id="landing-view" class="landing-container">
+      <div class="landing-hero-text">
+        <h1>Zero-Latency Voice Translation</h1>
+        <p>Speak in your language. Your partner hears in theirs. Live GPU sound-stream.</p>
+      </div>
+
+      <!-- Language & Identity Setup Strip -->
+      <div class="card setup-card">
+        <div class="setup-grid">
+          <div class="field-group">
+            <label for="display-name">Profile Name</label>
+            <input id="display-name" type="text" placeholder="Your Name" maxlength="48" />
+          </div>
+
+          <div class="field-group">
+            <label for="source-lang">I Speak</label>
+            <select id="source-lang">
+              <option value="auto" selected>Auto Detect</option>
+              <option value="en">English (en)</option>
+              <option value="hi">Hindi (hi)</option>
+              <option value="es">Spanish (es)</option>
+              <option value="fr">French (fr)</option>
+              <option value="de">German (de)</option>
+              <option value="zh">Chinese (zh)</option>
+              <option value="ar">Arabic (ar)</option>
+              <option value="ru">Russian (ru)</option>
+              <option value="pt">Portuguese (pt)</option>
+            </select>
+          </div>
+
+          <div class="field-group">
+            <label for="target-lang">I Want to Hear</label>
+            <select id="target-lang">
+              <option value="en" selected>English (en) — HD Voice</option>
+              <option value="hi">Hindi (hi) — HD Voice</option>
+              <option value="es">Spanish (es)</option>
+              <option value="fr">French (fr)</option>
+              <option value="de">German (de)</option>
+              <option value="zh">Chinese (zh)</option>
+              <option value="ar">Arabic (ar)</option>
+              <option value="pt">Portuguese (pt)</option>
+              <option value="ru">Russian (ru)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="lang-row voice-settings-row">
+          <div class="field-group">
+            <label for="voice-persona">🎭 Voice Character</label>
+            <select id="voice-persona">
+              <option value="nh-m01">Arnav (Male Natural - Balanced)</option>
+              <option value="nh-f01">Priya (Female Warm - Expressive)</option>
+              <option value="dhvaani-ramesh">Ramesh Babu (Wise Indic Teacher)</option>
+              <option value="dhvaani-male">Dev (Male Deep - Authoritative)</option>
+              <option value="dhvaani-female">Isha (Female Cheerful - Friendly)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label for="voice-tone">🎵 Delivery Tone</label>
+            <select id="voice-tone">
+              <option value="natural">Natural &amp; Conversational</option>
+              <option value="formal">Professional &amp; Formal</option>
+              <option value="cheerful">Warm &amp; Cheerful</option>
+              <option value="calm">Calm &amp; Empathetic</option>
+              <option value="dynamic">Dynamic &amp; Energetic</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Collapsible Audio Devices & Settings -->
+        <details class="advanced-settings">
+          <summary>Audio Devices & Advanced</summary>
+          <div class="advanced-grid">
+            <div class="field-group">
+              <label for="input-device">Microphone</label>
+              <select id="input-device"></select>
+            </div>
+            <div class="field-group">
+              <label for="output-device">Speaker</label>
+              <select id="output-device"></select>
+            </div>
+            <div class="field-group">
+              <label for="relay-url">Relay Server</label>
+              <input id="relay-url" type="text" value="https://windows-live-translation-app-1.onrender.com" />
+            </div>
+            <div class="field-group checkbox-group">
+              <label class="inline-checkbox">
+                <input id="captions-on" type="checkbox" checked />
+                <span>Show live captions during call</span>
+              </label>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- Microphone Discovery & Permission Bar -->
+      <div id="mic-status-bar" class="mic-status-bar" style="margin: 0.75rem 0 1.25rem 0; display: flex; align-items: center; justify-content: space-between; background: rgba(30, 41, 59, 0.8); border: 1px solid #334155; padding: 0.65rem 1rem; border-radius: 8px;">
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <span id="mic-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: #f59e0b; display: inline-block;"></span>
+          <span id="mic-status-label" style="font-size: 0.88rem; color: #cbd5e1; font-weight: 500;">Microphone: Tap to enable</span>
+        </div>
+        <button id="btn-discover-mic" type="button" style="background: #2563eb; color: #fff; border: none; padding: 0.45rem 0.9rem; border-radius: 6px; font-size: 0.82rem; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 0.4rem;">
+          🎙️ Discover &amp; Allow Mic
+        </button>
+      </div>
+
+      <!-- Relay Status Alert Banner -->
+      <div id="landing-error-banner" class="landing-error-banner" style="display: none;"></div>
+
+      <!-- 2 Hero Options: Host or Join -->
+      <div class="hero-actions-container">
+        <!-- OPTION 1: HOST -->
+        <div class="action-card host-card">
+          <div class="card-icon">🎙️</div>
+          <h2>Host New Call</h2>
+          <p>Create a fresh 1:1 room instantly and invite your partner with a code.</p>
+          
+          <div class="card-field">
+            <label for="host-name-input">Your Name</label>
+            <input 
+              id="host-name-input" 
+              type="text" 
+              class="name-input" 
+              placeholder="e.g. Alex (Host)" 
+              maxlength="32" 
+              autocomplete="name" 
+            />
+          </div>
+
+          <button id="btn-host" class="btn-primary btn-large">
+            <span>🎙️</span> Host Call
+          </button>
+          <span id="host-hint" class="join-hint"></span>
+        </div>
+
+        <div class="action-divider">
+          <span class="divider-line"></span>
+          <span class="divider-badge">OR</span>
+          <span class="divider-line"></span>
+        </div>
+
+        <!-- OPTION 2: JOIN -->
+        <div class="action-card join-card">
+          <div class="card-icon">🔗</div>
+          <h2>Join with Code</h2>
+          <p>Got a 6-character code? Enter your name and code to join immediately.</p>
+          
+          <div class="card-field">
+            <label for="join-name-input">Your Name <span class="required-star">*</span></label>
+            <input 
+              id="join-name-input" 
+              type="text" 
+              class="name-input" 
+              placeholder="Enter your name (e.g. Rahul)" 
+              maxlength="32" 
+              autocomplete="name" 
+            />
+          </div>
+
+          <div class="card-field">
+            <label for="room-code-input">Room Code</label>
+            <div class="join-input-wrapper">
+              <input 
+                id="room-code-input" 
+                type="text" 
+                class="code-input" 
+                placeholder="KHJP3J" 
+                maxlength="6" 
+                autocomplete="off" 
+                spellcheck="false" 
+              />
+              <button id="btn-paste-code" class="btn-icon" title="Paste from clipboard">📋</button>
+            </div>
+          </div>
+          
+          <button id="btn-join" class="btn-secondary btn-large">
+            <span>🔗</span> Join Call
+          </button>
+          <span id="join-hint" class="join-hint">Auto-connects when 6-char code is entered</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- IN-CALL VIEW (Active Call) -->
+    <section id="call-view" class="call-container" style="display: none;">
+      <!-- Active Room Header Banner -->
+      <div class="room-banner">
+        <div class="room-code-group">
+          <span class="room-label">ROOM CODE:</span>
+          <span id="active-room-display" class="room-code-badge">------</span>
+          <button id="btn-copy-code" class="btn-pill" title="Copy 6-digit code">
+            📋 Copy Code
+          </button>
+          <button id="btn-copy-invite" class="btn-pill" title="Copy full invite message">
+            ✉️ Copy Invite
+          </button>
+          <span id="copy-toast" class="copy-toast"></span>
+        </div>
+
+        <div class="room-controls">
+          <button type="button" id="btn-toggle-mic" class="btn-mic-toggle" title="Microphone Active. Click to Disable.">
+            <span id="mic-icon" class="mic-btn-icon">🎙️</span>
+            <span id="mic-text">Disable Mic</span>
+          </button>
+          <button id="btn-end" class="btn-danger">
+            📞 End Call
+          </button>
+        </div>
+      </div>
+
+      <!-- Peer Status / Waiting Alert -->
+      <div id="peer-status-box" class="peer-status-box waiting">
+        <span class="status-indicator-dot"></span>
+        <span id="peer-status-text">Waiting for your partner to join... Share your room code.</span>
+      </div>
+
+      <!-- Mid-Call Audio & Settings Bar -->
+      <div class="call-controls-bar">
+        <div class="midcall-langs">
+          <label>
+            <span>Speaking:</span>
+                        <select id="midcall-source-lang">
+                <option value="auto" selected>Auto Detect</option>
+                <option value="en">English (en)</option>
+                <option value="hi">Hindi (hi)</option>
+                <option value="es">Spanish (es)</option>
+                <option value="fr">French (fr)</option>
+                <option value="de">German (de)</option>
+                <option value="zh">Chinese (zh)</option>
+                <option value="ar">Arabic (ar)</option>
+                <option value="ru">Russian (ru)</option>
+                <option value="pt">Portuguese (pt)</option>
+              </select>
+            </label>
+            <label>
+              <span>Hearing:</span>
+              <select id="midcall-target-lang">
+                <option value="en">English (en)</option>
+                <option value="hi">Hindi (hi)</option>
+                <option value="es">Spanish (es)</option>
+                <option value="fr">French (fr)</option>
+                <option value="de">German (de)</option>
+                <option value="zh">Chinese (zh)</option>
+                <option value="ar">Arabic (ar)</option>
+                <option value="pt">Portuguese (pt)</option>
+                <option value="ru">Russian (ru)</option>
+              </select>
+          </label>
+        </div>
+
+        <div class="midcall-voice-settings">
+          <label title="Voice Persona & Character">
+            <span>🎭 Voice:</span>
+            <select id="midcall-voice-persona">
+              <option value="nh-m01">Arnav (Male Natural)</option>
+              <option value="nh-f01">Priya (Female Warm)</option>
+              <option value="dhvaani-ramesh">Ramesh Babu (Teacher)</option>
+              <option value="dhvaani-male">Dev (Male Deep)</option>
+              <option value="dhvaani-female">Isha (Female Cheerful)</option>
+            </select>
+          </label>
+          <label title="Speech Delivery Tone">
+            <span>🎵 Tone:</span>
+            <select id="midcall-voice-tone">
+              <option value="natural">Natural</option>
+              <option value="formal">Professional</option>
+              <option value="cheerful">Warm &amp; Cheerful</option>
+              <option value="calm">Calm &amp; Empathetic</option>
+              <option value="dynamic">Dynamic</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="midcall-audio">
+          <label class="volume-slider-label">
+            <span>Gain</span>
+            <input id="input-gain" type="range" min="0" max="2" step="0.05" value="1" />
+            <span id="gain-readout">1.00</span>
+          </label>
+          <div class="vu-wrapper">
+            <span>Mic</span>
+            <div class="vu-track">
+              <div id="vu-fill" class="vu-fill"></div>
+            </div>
+          </div>
+        </div>
+
+        
+      </div>
+
+      <!-- Main In-Call Workspace: Participants & Live Captions -->
+      <div class="call-workspace">
+        <aside class="participants-pane">
+          <h3>Participants (1:1)</h3>
+          <ul id="participants"></ul>
+        </aside>
+
+        <section class="voice-stream-pane" id="voice-stream-pane">
+          <div class="voice-stream-header">
+            <div class="stream-title-group">
+              <span class="live-pulse-dot"></span>
+              <h3>Neural Voice Stream</h3>
+              <span class="stream-badge" id="stream-engine-badge">GPU Sound-Stream</span>
+              <div id="voice-switch-loader" class="voice-switch-loader" style="display: none;">
+                <span class="spinner-circle"></span>
+                <span id="voice-switch-text">Switching Voice...</span>
+              </div>
+            </div>
+            <div class="abr-pill" id="abr-status-pill" title="Adaptive Bitrate Quality Status">
+              <span class="abr-indicator optimal"></span>
+              <span id="abr-status-text">ABR: Optimal (16kHz / 48kHz HD)</span>
+              <span class="abr-latency" id="abr-latency-text">&lt; 80ms</span>
+            </div>
+          </div>
+
+          <div class="voice-visualizer-container">
+            <!-- Outbound Local Voice Waveform & Activity -->
+            <div class="voice-channel-card outbound">
+              <div class="channel-header">
+                <div class="channel-info">
+                  <span class="channel-icon">🎙️</span>
+                  <div>
+                    <span class="channel-label">My Voice (Outbound)</span>
+                    <span class="channel-sub" id="outbound-lang-label">Speaking: English</span>
+                  </div>
+                </div>
+                <span class="activity-badge idle" id="outbound-vad-badge">Listening</span>
+              </div>
+              <div class="waveform-bars" id="outbound-waveform">
+                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+              </div>
+            </div>
+
+            <!-- Inbound Partner Translated Voice Waveform & Activity -->
+            <div class="voice-channel-card inbound">
+              <div class="channel-header">
+                <div class="channel-info">
+                  <span class="channel-icon">🔊</span>
+                  <div>
+                    <span class="channel-label">Partner Voice (Translated)</span>
+                    <span class="channel-sub" id="inbound-lang-label">Hearing: Hindi</span>
+                  </div>
+                </div>
+                <span class="activity-badge idle" id="inbound-vad-badge">Connected</span>
+              </div>
+              <div class="waveform-bars" id="inbound-waveform">
+                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="audio-stream-footer">
+            <div class="stream-stat">
+              <span class="stat-label">Latency:</span>
+              <span class="stat-value" id="stat-latency">&lt; 150ms (Ultra-Low)</span>
+            </div>
+            <div class="stream-stat">
+              <span class="stat-label">Silence Commit (VAD):</span>
+              <span class="stat-value active" id="stat-vad">Active (350ms Pause)</span>
+            </div>
+            <div class="stream-stat">
+              <span class="stat-label">Audio Jitter Buffer:</span>
+              <span class="stat-value" id="stat-jitter">60ms Smooth Playback</span>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

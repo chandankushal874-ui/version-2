@@ -1,0 +1,2 @@
+6e69d33833a4aa714ad2378dabfc53b5f003543313f010104321831cb3cbe594  ollalink-translate.exe
+a5bc9a97fed9ffff119b86e2aca92e5cc978bd2fd35ecb77559756706b6b292e  Ollalink-Translate-Windows-x64.zip

@@ -1,0 +1,328 @@
+﻿//! main.rs â€” Tauri entrypoint.
+//!
+//! Spawns the Tokio runtime in a dedicated thread (so the WebView main thread
+//! is never blocked), wires Tauri commands to the call state machine, and
+//! brings up the UI.
+
+mod audio;
+mod prefs;
+mod protocol;
+mod state;
+mod ws;
+
+use state::AppState;
+use tauri::Manager;
+use tracing_subscriber::EnvFilter;
+
+static RELAY_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+fn try_spawn_local_relay() {
+    if std::net::TcpStream::connect("127.0.0.1:8787").is_ok() {
+        tracing::info!("Local relay already running on port 8787");
+        return;
+    }
+
+    let mut search_dirs = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        search_dirs.push(cwd.clone());
+        if let Some(parent) = cwd.parent() {
+            search_dirs.push(parent.to_path_buf());
+            if let Some(grandparent) = parent.parent() {
+                search_dirs.push(grandparent.to_path_buf());
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.to_path_buf());
+            if let Some(parent) = dir.parent() {
+                search_dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    let rel_candidates = [
+        "server/src/server.js",
+        "dist-package/server/src/server.js",
+    ];
+
+    for base in &search_dirs {
+        for rel in &rel_candidates {
+            let server_js = base.join(rel);
+            if server_js.exists() {
+                if let Some(server_root) = server_js.parent().and_then(|p| p.parent()) {
+                    let mut cmd = std::process::Command::new("node");
+                    let env_file = server_root.join(".env");
+                    if env_file.exists() {
+                        cmd.arg("--env-file=.env");
+                    }
+                    cmd.arg("src/server.js");
+                    cmd.current_dir(server_root);
+
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        cmd.creation_flags(CREATE_NO_WINDOW);
+                    }
+
+                    match cmd.spawn() {
+                        Ok(child) => {
+                            tracing::info!("Auto-spawned local relay daemon (PID: {}) from {}", child.id(), server_root.display());
+                            if let Ok(mut lock) = RELAY_CHILD.lock() {
+                                *lock = Some(child);
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to auto-spawn local relay via node: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_local_relay() {
+    if let Ok(mut lock) = RELAY_CHILD.lock() {
+        if let Some(mut child) = lock.take() {
+            let _ = child.kill();
+        }
+    }
+}
+
+fn main() {
+    // Install default crypto provider for rustls 0.23 (tokio-tungstenite WSS TLS connections)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Catch any panic and write to persistent log instead of hard crash
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {}", info);
+        eprintln!("{}", msg);
+        if let Some(mut path) = dirs::data_dir() {
+            path.push("com.ollalink.translate");
+            let _ = std::fs::create_dir_all(&path);
+            path.push("crash.log");
+            let _ = std::fs::write(path, &msg);
+        }
+    }));
+
+    // Structured logging â€” RUST_LOG env overrides the default info level.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_thread_ids(true)
+        .compact()
+        .init();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_shell::init())
+        .setup(|app| {
+            try_spawn_local_relay();
+            let handle = app.handle().clone();
+            let state = AppState::new(handle);
+            app.manage(state);
+            Ok(())
+        })
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                cleanup_local_relay();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::mint_session,
+            commands::list_audio_devices,
+            commands::start_call,
+            commands::end_call,
+            commands::call_status,
+            commands::set_input_volume,
+            commands::set_mic_muted,
+            commands::swap_input_device,
+            commands::swap_output_device,
+            commands::load_prefs,
+            commands::save_prefs,
+            commands::set_captions,
+            commands::change_languages,
+            commands::update_voice_settings,
+            commands::check_relay_health,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands â€” the UI â†” Rust bridge. All async, all return Result<_, String>.
+// ---------------------------------------------------------------------------
+
+pub mod commands {
+    use super::state::{AppState, CallArgs, CallState, SessionCredentials};
+    use serde::Serialize;
+    use tauri::State;
+
+    /// Mint a session token via the relay server.
+    /// Returns the WsUrl and token the app will use when starting a call.
+    #[tauri::command]
+    pub async fn mint_session(
+        relay_url: String,
+        user_id: String,
+        source_lang: String,
+        target_lang: String,
+        voice: Option<String>,
+        tone: Option<String>,
+    ) -> Result<SessionCredentials, String> {
+        crate::ws::mint_session_via_relay(
+            &relay_url,
+            &user_id,
+            &source_lang,
+            &target_lang,
+            voice.as_deref(),
+            tone.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Start a call: join a room, open the Ollalink upstream, start audio.
+    #[tauri::command]
+    pub async fn start_call(
+        state: State<'_, AppState>,
+        args: CallArgs,
+    ) -> Result<serde_json::Value, String> {
+        state.start_call(args).await.map_err(|e| e.to_string())
+    }
+
+    /// End the current call.
+    #[tauri::command]
+    pub async fn end_call(state: State<'_, AppState>) -> Result<(), String> {
+        state.end_call().await.map_err(|e| e.to_string())
+    }
+
+    /// Snapshot of current call state for the UI.
+    #[tauri::command]
+    pub async fn call_status(state: State<'_, AppState>) -> Result<CallState, String> {
+        Ok(state.status().await)
+    }
+
+    /// Enumerate input/output audio devices for the picklist.
+    #[tauri::command]
+    pub async fn list_audio_devices() -> Result<AudioDeviceList, String> {
+        crate::audio::list_devices().map_err(|e| e.to_string())
+    }
+
+        /// Mute or unmute the microphone mid-call.
+    #[tauri::command]
+    pub async fn set_mic_muted(state: State<'_, AppState>, muted: bool) -> Result<(), String> {
+        state.set_mic_muted(muted);
+        Ok(())
+    }
+
+    /// Live input gain (0.0–2.0).
+    #[tauri::command]
+    pub async fn set_input_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
+        state.set_input_volume(volume);
+        Ok(())
+    }
+
+    /// Hot-swap microphone mid-call. Pass null to use default.
+    #[tauri::command]
+    pub async fn swap_input_device(
+        state: State<'_, AppState>,
+        name: Option<String>,
+    ) -> Result<(), String> {
+        state.swap_input_device(name).await.map_err(|e| e.to_string())
+    }
+
+    /// Hot-swap speaker mid-call. Pass null to use default.
+    #[tauri::command]
+    pub async fn swap_output_device(
+        state: State<'_, AppState>,
+        name: Option<String>,
+    ) -> Result<(), String> {
+        state.swap_output_device(name).await.map_err(|e| e.to_string())
+    }
+
+    /// Load persisted user prefs (display name, langs, devices, relay URL).
+    #[tauri::command]
+    pub async fn load_prefs() -> Result<crate::prefs::UserPrefs, String> {
+        Ok(crate::prefs::load())
+    }
+
+    /// Save user prefs to disk.
+    #[tauri::command]
+    pub async fn save_prefs(prefs: crate::prefs::UserPrefs) -> Result<(), String> {
+        crate::prefs::save(&prefs).map_err(|e| e.to_string())
+    }
+
+    /// Toggle live captions (mid-call).
+    #[tauri::command]
+    pub async fn set_captions(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+        state.set_captions(on).await.map_err(|e| e.to_string())
+    }
+
+    /// Change languages mid-call.
+    #[tauri::command]
+    pub async fn change_languages(
+        state: State<'_, AppState>,
+        source_lang: Option<String>,
+        target_lang: Option<String>,
+    ) -> Result<(), String> {
+        state.change_languages(source_lang, target_lang).await.map_err(|e| e.to_string())
+    }
+
+    /// Update voice persona and tone mid-call.
+    #[tauri::command]
+    pub async fn update_voice_settings(
+        state: State<'_, AppState>,
+        voice: Option<String>,
+        tone: Option<String>,
+    ) -> Result<(), String> {
+        state.update_voice_settings(voice, tone).await.map_err(|e| e.to_string())
+    }
+
+    /// Probe relay health bypassing webview CORS.
+    #[tauri::command]
+    pub async fn check_relay_health(relay_url: String) -> Result<bool, String> {
+        let mut base = relay_url.trim().to_string();
+        if !base.starts_with("http://") && !base.starts_with("https://") && !base.starts_with("ws://") && !base.starts_with("wss://") {
+            if base.starts_with("localhost") || base.starts_with("127.0.0.1") {
+                base = format!("http://{}", base);
+            } else {
+                base = format!("https://{}", base);
+            }
+        }
+        let base = base.replace("wss://", "https://").replace("ws://", "http://");
+        let base = base.trim_end_matches("/call").trim_end_matches('/');
+        let url = format!("{}/api/health", base);
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(6))
+            .build() {
+                Ok(c) => c,
+                Err(e) => return Err(e.to_string()),
+            };
+        match client.get(&url).send().await {
+            Ok(res) => Ok(res.status().is_success()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct AudioDeviceList {
+        pub inputs: Vec<String>,
+        pub outputs: Vec<String>,
+        pub default_input: Option<String>,
+        pub default_output: Option<String>,
+    }
+
+    // Re-export so the commands module exposes SessionCredentials to TS via specta/serde.
+    pub use crate::state::SessionCredentials as _SC;
+}

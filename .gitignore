@@ -1,0 +1,43 @@
+﻿# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Secrets ΓÇö never commit
+.env
+.env.local
+*.pem
+*.pfx
+secrets.json
+
+# Node dependencies and build artifacts
+node_modules/
+dist/
+dist-package/
+*.log
+
+# Rust / Tauri build artifacts
+app/src-tauri/target/
+app/ui/dist/
+app/ui/node_modules/
+
+# Compiled Binaries & Packages (stored in releases, not git)
+*.msi
+*.exe
+*.app
+*.dmg
+*.zip
+
+# Audio test buffers
+*.wav
+*.pcm
+capture-*
+
+# Compiled JS twins (vite resolves .js before .ts)
+app/ui/src/*.js
+!server/**/*.js
+
+Screenshots/
