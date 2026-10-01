@@ -89,6 +89,7 @@ pub struct AppState {
     active: Arc<Mutex<Option<ActiveCall>>>,
     input_volume: Arc<AtomicU32>, // f32 bits; 1.0 default
     mic_muted: Arc<AtomicBool>,
+    speaker_muted: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -99,6 +100,7 @@ impl AppState {
             active: Arc::new(Mutex::new(None)),
             input_volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             mic_muted: Arc::new(AtomicBool::new(false)),
+            speaker_muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -113,6 +115,19 @@ impl AppState {
                 call.audio.set_mic_muted(muted);
             }
         }
+    }
+
+    pub fn set_speaker_muted(&self, muted: bool) {
+        self.speaker_muted.store(muted, Ordering::Relaxed);
+        if let Ok(guard) = self.active.try_lock() {
+            if let Some(call) = guard.as_ref() {
+                call.audio.set_speaker_muted(muted);
+            }
+        }
+    }
+
+    pub fn is_speaker_muted(&self) -> bool {
+        self.speaker_muted.load(Ordering::Relaxed)
     }
 
     pub fn set_input_volume(&self, v: f32) {
@@ -272,6 +287,8 @@ impl AppState {
             .context("start audio pipeline")?;
 
         audio.set_input_gain(f32::from_bits(self.input_volume.load(Ordering::Relaxed)));
+        audio.set_mic_muted(self.mic_muted.load(Ordering::Relaxed));
+        audio.set_speaker_muted(self.speaker_muted.load(Ordering::Relaxed));
 
         let voice_state = Arc::new(RwLock::new(args.voice.clone()));
         let tone_state = Arc::new(RwLock::new(args.tone.clone()));

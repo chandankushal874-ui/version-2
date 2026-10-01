@@ -83,4 +83,10 @@ export class CallController {
     if (!this.active) return;
     await this.invoke('set_mic_muted', { muted });
   }
+
+  /** Mute or unmute speaker output mid-call. */
+  async setSpeakerMuted(muted: boolean): Promise<void> {
+    if (!this.active) return;
+    await this.invoke('set_speaker_muted', { muted });
+  }
 }

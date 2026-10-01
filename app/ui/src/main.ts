@@ -263,24 +263,22 @@ async function main() {
     }
   }
 
+  const LOCAL_RELAY_URL = 'http://localhost:8787';
+
   async function probeRelayHealth() {
     if (controller.isActive() || isConnecting) return;
-    const currentRelay = relayUrl.value.trim();
-    let isOk = await checkTargetRelayHealth(currentRelay);
 
-    // Auto-failover: if current relay (e.g. localhost) is unreachable, probe and switch to Cloud Relay automatically
-    if (!isOk && currentRelay !== CLOUD_RELAY_URL) {
-      const cloudOk = await checkTargetRelayHealth(CLOUD_RELAY_URL);
-      if (cloudOk) {
-        console.info(`[Relay] Relay at ${currentRelay} is offline; automatically switching to Cloud Relay: ${CLOUD_RELAY_URL}`);
-        relayUrl.value = CLOUD_RELAY_URL;
-        isOk = true;
+    // Check if high-performance local relay is active (top priority)
+    const localOk = await checkTargetRelayHealth(LOCAL_RELAY_URL);
+    if (localOk) {
+      if (relayUrl.value.trim() !== LOCAL_RELAY_URL) {
+        relayUrl.value = LOCAL_RELAY_URL;
         try {
           await invoke('save_prefs', {
             prefs: {
               version: 1,
               displayName: displayName.value || '',
-              relayUrl: CLOUD_RELAY_URL,
+              relayUrl: LOCAL_RELAY_URL,
               sourceLang: sourceLang.value || 'en',
               targetLang: targetLang.value || 'hi',
               voicePersona: voicePersona.value || 'nh-m01',
@@ -291,6 +289,25 @@ async function main() {
             },
           });
         } catch {}
+      }
+      landingErrorBanner.style.display = 'none';
+      if (!controller.isActive() && !isConnecting) {
+        setStatus('idle', '🟢 local relay online');
+      }
+      return;
+    }
+
+    // If local relay is not running, check currently configured relay
+    const currentRelay = relayUrl.value.trim();
+    let isOk = await checkTargetRelayHealth(currentRelay);
+
+    // Auto-failover to cloud relay if current relay is offline
+    if (!isOk && currentRelay !== CLOUD_RELAY_URL) {
+      const cloudOk = await checkTargetRelayHealth(CLOUD_RELAY_URL);
+      if (cloudOk) {
+        console.info(`[Relay] Relay at ${currentRelay} is offline; automatically switching to Cloud Relay: ${CLOUD_RELAY_URL}`);
+        relayUrl.value = CLOUD_RELAY_URL;
+        isOk = true;
       }
     }
 
@@ -554,9 +571,69 @@ async function main() {
     });
   }
 
+  // ---------- Speaker Enable / Disable Controls ----------
+  const btnToggleSpeaker = document.getElementById('btn-toggle-speaker') as HTMLButtonElement | null;
+  const speakerIcon = document.getElementById('speaker-icon');
+  const speakerText = document.getElementById('speaker-text');
+  let isSpeakerMuted = false;
+
+  async function updateSpeakerMuteState(muted: boolean) {
+    isSpeakerMuted = muted;
+    try {
+      if (controller && controller.isActive()) {
+        await controller.setSpeakerMuted(muted);
+      }
+    } catch (e) {
+      console.warn('setSpeakerMuted error:', e);
+    }
+
+    if (btnToggleSpeaker) {
+      if (muted) {
+        btnToggleSpeaker.classList.add('muted');
+        if (speakerIcon) speakerIcon.textContent = '🔇';
+        if (speakerText) speakerText.textContent = 'Enable Speaker';
+        btnToggleSpeaker.title = 'Speaker Disabled (Muted). Click to Enable.';
+      } else {
+        btnToggleSpeaker.classList.remove('muted');
+        if (speakerIcon) speakerIcon.textContent = '🔊';
+        if (speakerText) speakerText.textContent = 'Disable Speaker';
+        btnToggleSpeaker.title = 'Speaker Active. Click to Disable.';
+      }
+    }
+
+    const inboundVadBadge = document.getElementById('inbound-vad-badge');
+    const inboundWaveform = document.getElementById('inbound-waveform');
+    if (muted) {
+      if (inboundVadBadge) {
+        inboundVadBadge.className = 'activity-badge muted';
+        inboundVadBadge.textContent = 'Muted';
+      }
+      if (inboundWaveform) {
+        inboundWaveform.classList.add('muted');
+      }
+      setStatus('idle', '🔇 Speaker Disabled (Muted) — Incoming audio output silenced');
+    } else {
+      if (inboundVadBadge) {
+        inboundVadBadge.className = 'activity-badge idle';
+        inboundVadBadge.textContent = 'Connected';
+      }
+      if (inboundWaveform) {
+        inboundWaveform.classList.remove('muted');
+      }
+      setStatus('idle', '🔊 Speaker Active — Hearing translated speech');
+    }
+  }
+
+  if (btnToggleSpeaker) {
+    btnToggleSpeaker.addEventListener('click', async () => {
+      await updateSpeakerMuteState(!isSpeakerMuted);
+    });
+  }
+
   // ---------- Call Orchestration & Role-Aware Banners ----------
   function switchToCallView(room: string, isHost: boolean) {
     updateMicMuteState(false);
+    updateSpeakerMuteState(false);
     currentRoom = room;
     isCurrentCallHost = isHost;
     activeRoomDisplay.textContent = room;

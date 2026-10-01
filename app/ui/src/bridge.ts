@@ -40,6 +40,7 @@ let nextPlayTime = 0;
 let browserPlaybackGen = 0;
 // Concern C Fix: Sequential audio play queue serializes asynchronous WAV decoding and synchronous PCM scheduling
 let audioPlayQueue: Promise<void> = Promise.resolve();
+let speakerMuted = false;
 let pendingAudioMetaQueue: { sampleRate: number }[] = [];
 // Bug 3 Fix: Buffer for orphan binary frames arriving before text header
 let pendingBinaryQueue: ArrayBuffer[] = [];
@@ -214,6 +215,11 @@ function playInboundAudioChunk(buffer: any, sampleRate?: number) {
         const decoded = await playbackCtx.decodeAudioData(buffer.slice(0));
         // Bug 34 Fix: Check again after async decode completes to avoid ghost playback
         if (currentPlaybackGen !== browserPlaybackGen) return;
+        if (speakerMuted) {
+          for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
+            decoded.getChannelData(ch).fill(0);
+          }
+        }
         const float32 = decoded.getChannelData(0);
         let peak = 0;
         for (let i = 0; i < float32.length; i++) {
@@ -266,7 +272,7 @@ function playInboundAudioChunk(buffer: any, sampleRate?: number) {
     const float32 = new Float32Array(numSamples);
     let peak = 0;
     for (let i = 0; i < numSamples; i++) {
-      const s = Math.max(-1.0, Math.min(1.0, int16[i] / 32768.0));
+      const s = speakerMuted ? 0 : Math.max(-1.0, Math.min(1.0, int16[i] / 32768.0));
       float32[i] = s;
       const abs = Math.abs(s);
       if (abs > peak) peak = abs;
@@ -790,6 +796,11 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       if (activeStream) {
         activeStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
       }
+      return null as T;
+    }
+
+    case 'set_speaker_muted': {
+      speakerMuted = !!(args as any)?.muted;
       return null as T;
     }
 

@@ -162,6 +162,10 @@ impl AudioPipeline {
         self.mic_muted.store(muted, Ordering::Relaxed);
     }
 
+    pub fn set_speaker_muted(&self, muted: bool) {
+        self.jitter.set_speaker_muted(muted);
+    }
+
     pub async fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(s) = self.input_stream.lock().take() { let _ = s.pause(); }

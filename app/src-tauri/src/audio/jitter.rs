@@ -38,6 +38,8 @@ pub struct JitterPlayer {
     /// D12 Fix: Running peak of the current utterance (downlink normalization).
     /// Reset on utterance end; scales quiet TTS output up toward -1 dBFS headroom.
     utterance_peak: AtomicU32, // f32 bits
+    /// Enable / disable speaker output without breaking real-time audio pipeline journey.
+    speaker_muted: AtomicBool,
 }
 
 impl JitterPlayer {
@@ -54,6 +56,7 @@ impl JitterPlayer {
             underruns: AtomicU64::new(0),
             resamplers: Mutex::new(HashMap::new()),
             utterance_peak: AtomicU32::new(0.0f32.to_bits()),
+            speaker_muted: AtomicBool::new(false),
         }
     }
 
@@ -241,12 +244,14 @@ impl JitterPlayer {
         }
 
         let ch = self.out_channels.load(Ordering::Relaxed);
+        let speaker_muted = self.speaker_muted.load(Ordering::Relaxed);
         let mut i = 0;
         while i < needed {
             if let Some(next) = ring.pop_front() {
                 self.consecutive_empty.store(0, Ordering::Relaxed);
                 // Clamp to prevent DAC clipping/distortion noise (Bug #2 fix)
-                let clamped = next.clamp(-1.0, 1.0);
+                // When speaker is muted, output pure silence without interrupting real-time drain or jitter timing
+                let clamped = if speaker_muted { 0.0 } else { next.clamp(-1.0, 1.0) };
                 for c in 0..ch {
                     if i + c < needed {
                         out[i + c] = <T as cpal::FromSample<f32>>::from_sample_(clamped);
@@ -339,6 +344,16 @@ impl JitterPlayer {
             return false;
         }
         !self.ring.lock().is_empty()
+    }
+
+    /// Enable or disable speaker audio output mid-call.
+    pub fn set_speaker_muted(&self, muted: bool) {
+        self.speaker_muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// Check if speaker audio output is currently muted.
+    pub fn is_speaker_muted(&self) -> bool {
+        self.speaker_muted.load(Ordering::Relaxed)
     }
 }
 
@@ -627,5 +642,30 @@ mod tests {
         let mut drain_out = [0.0f32; 48];
         player.fill_into(&mut drain_out);
         assert!(player.is_playing());
+    }
+
+    #[tokio::test]
+    async fn test_jitter_player_speaker_muted_outputs_silence_without_stalling() {
+        let player = JitterPlayer::new(48_000, 1, 10);
+        let pcm = vec![120u8; 960]; // 480 non-zero samples
+        player.push_audio(&pcm).await;
+
+        player.set_speaker_muted(true);
+        assert!(player.is_speaker_muted(), "is_speaker_muted must report true");
+
+        let mut out = [0.0f32; 128];
+        player.fill_into(&mut out);
+
+        // When muted, audio journey is maintained (samples popped), but output is zeroed
+        for sample in out.iter() {
+            assert_eq!(*sample, 0.0f32, "Muted speaker must output pure silence to DAC");
+        }
+
+        // Unmuting restores output immediately
+        player.set_speaker_muted(false);
+        assert!(!player.is_speaker_muted(), "is_speaker_muted must report false");
+        player.fill_into(&mut out);
+        let has_non_zero = out.iter().any(|&s| s != 0.0);
+        assert!(has_non_zero, "Unmuted speaker must output real audio samples immediately");
     }
 }

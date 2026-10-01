@@ -23,6 +23,17 @@ fn try_spawn_local_relay() {
     }
 
     let mut search_dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.to_path_buf());
+            if let Some(parent) = dir.parent() {
+                search_dirs.push(parent.to_path_buf());
+                if let Some(gp) = parent.parent() {
+                    search_dirs.push(gp.to_path_buf());
+                }
+            }
+        }
+    }
     if let Ok(cwd) = std::env::current_dir() {
         search_dirs.push(cwd.clone());
         if let Some(parent) = cwd.parent() {
@@ -32,18 +43,11 @@ fn try_spawn_local_relay() {
             }
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            search_dirs.push(dir.to_path_buf());
-            if let Some(parent) = dir.parent() {
-                search_dirs.push(parent.to_path_buf());
-            }
-        }
-    }
 
     let rel_candidates = [
         "server/src/server.js",
         "dist-package/server/src/server.js",
+        "src/server.js",
     ];
 
     for base in &search_dirs {
@@ -51,10 +55,30 @@ fn try_spawn_local_relay() {
             let server_js = base.join(rel);
             if server_js.exists() {
                 if let Some(server_root) = server_js.parent().and_then(|p| p.parent()) {
-                    let mut cmd = std::process::Command::new("node");
+                    let node_candidates = [
+                        base.join("node.exe"),
+                        base.join("server").join("node.exe"),
+                        server_root.join("node.exe"),
+                        std::path::PathBuf::from(r"C:\Program Files\nodejs\node.exe"),
+                        std::path::PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"),
+                        std::path::PathBuf::from("node"),
+                    ];
+
+                    let mut node_bin = std::path::PathBuf::from("node");
+                    for cand in &node_candidates {
+                        if cand.exists() {
+                            node_bin = cand.clone();
+                            break;
+                        }
+                    }
+
+                    let mut cmd = std::process::Command::new(&node_bin);
                     let env_file = server_root.join(".env");
                     if env_file.exists() {
                         cmd.arg("--env-file=.env");
+                    } else {
+                        cmd.env("OLLALINK_API_KEY", "sk_44935c9a9c2186a08697dd56ddc734cb165b94b060aebfd4");
+                        cmd.env("PORT", "8787");
                     }
                     cmd.arg("src/server.js");
                     cmd.current_dir(server_root);
@@ -68,14 +92,25 @@ fn try_spawn_local_relay() {
 
                     match cmd.spawn() {
                         Ok(child) => {
-                            tracing::info!("Auto-spawned local relay daemon (PID: {}) from {}", child.id(), server_root.display());
+                            tracing::info!("Auto-spawned local relay daemon (PID: {}) using {:?} from {}", child.id(), node_bin, server_root.display());
                             if let Ok(mut lock) = RELAY_CHILD.lock() {
                                 *lock = Some(child);
                             }
+
+                            // Wait up to 3 seconds for local relay port 8787 to accept TCP connections
+                            // Ensures port 8787 is ready BEFORE the Webview probes relay health
+                            for _ in 0..30 {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                if std::net::TcpStream::connect("127.0.0.1:8787").is_ok() {
+                                    tracing::info!("Local relay is ready on port 8787");
+                                    break;
+                                }
+                            }
+
                             return;
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to auto-spawn local relay via node: {}", e);
+                            tracing::warn!("Failed to auto-spawn local relay via {:?}: {}", node_bin, e);
                         }
                     }
                 }
@@ -92,7 +127,69 @@ fn cleanup_local_relay() {
     }
 }
 
+#[cfg(windows)]
+mod single_instance_win {
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CreateMutexW(lpMutexAttributes: *const std::ffi::c_void, bInitialOwner: i32, lpName: *const u16) -> isize;
+        pub fn GetLastError() -> u32;
+        pub fn CloseHandle(hObject: isize) -> i32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn EnumWindows(lpEnumFunc: Option<unsafe extern "system" fn(isize, isize) -> i32>, lParam: isize) -> i32;
+        pub fn GetWindowTextW(hWnd: isize, lpString: *mut u16, nMaxCount: i32) -> i32;
+        pub fn SetForegroundWindow(hWnd: isize) -> i32;
+        pub fn ShowWindow(hWnd: isize, nCmdShow: i32) -> i32;
+    }
+
+    pub const ERROR_ALREADY_EXISTS: u32 = 183;
+    pub const SW_RESTORE: i32 = 9;
+
+    pub struct MutexGuard(pub isize);
+    impl Drop for MutexGuard {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { CloseHandle(self.0); }
+            }
+        }
+    }
+}
+
 fn main() {
+    // 1. Single Instance Named Mutex Check (Windows)
+    // Ensures duplicate launches NEVER initialize a second WebView2 on the same User Data Folder,
+    // which completely eliminates WebView2 error 0x800700AA ("The requested resource is in use").
+    #[cfg(windows)]
+    let _instance_mutex_guard = {
+        use single_instance_win::*;
+        let mutex_name: Vec<u16> = "Global\\OllalinkTranslateSingleInstanceMutex\0".encode_utf16().collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr()) };
+        if handle != 0 && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                unsafe extern "system" fn enum_windows_callback(hwnd: isize, _lparam: isize) -> i32 {
+                    let mut title = [0u16; 512];
+                    let len = GetWindowTextW(hwnd, title.as_mut_ptr(), 512);
+                    if len > 0 {
+                        let title_str = String::from_utf16_lossy(&title[..len as usize]);
+                        if title_str.contains("Ollalink Translate") {
+                            ShowWindow(hwnd, SW_RESTORE);
+                            SetForegroundWindow(hwnd);
+                            return 0; // stop enumeration
+                        }
+                    }
+                    1 // continue
+                }
+                EnumWindows(Some(enum_windows_callback), 0);
+                CloseHandle(handle);
+            }
+            // Another instance is already running!
+            // Exit immediately BEFORE initializing WebView2 to completely avoid HRESULT 0x800700AA ("The requested resource is in use")
+            return;
+        }
+        MutexGuard(handle)
+    };
+
     // Install default crypto provider for rustls 0.23 (tokio-tungstenite WSS TLS connections)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -147,6 +244,7 @@ fn main() {
             commands::call_status,
             commands::set_input_volume,
             commands::set_mic_muted,
+            commands::set_speaker_muted,
             commands::swap_input_device,
             commands::swap_output_device,
             commands::load_prefs,
@@ -223,6 +321,13 @@ pub mod commands {
     #[tauri::command]
     pub async fn set_mic_muted(state: State<'_, AppState>, muted: bool) -> Result<(), String> {
         state.set_mic_muted(muted);
+        Ok(())
+    }
+
+    /// Mute or unmute speaker output mid-call.
+    #[tauri::command]
+    pub async fn set_speaker_muted(state: State<'_, AppState>, muted: bool) -> Result<(), String> {
+        state.set_speaker_muted(muted);
         Ok(())
     }
 
