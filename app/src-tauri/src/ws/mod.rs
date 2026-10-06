@@ -224,7 +224,7 @@ impl RelaySocket {
                     Message::Text(t) => {
                         let raw_val: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
                         match serde_json::from_str::<ServerEvent>(&t) {
-                            Ok(ServerEvent::Audio { end_of_utterance, has_binary, sample_rate, last, lang: _, ref codec, ref audio_b64, .. }) => {
+                            Ok(ServerEvent::Audio { end_of_utterance, has_binary, sample_rate, last, ref lang, ref codec, ref audio_b64, .. }) => {
                                 let is_marker = end_of_utterance.unwrap_or(false);
                                 let is_last = last.unwrap_or(false);
                                 let carries_binary = has_binary.unwrap_or(!is_marker);
@@ -233,7 +233,11 @@ impl RelaySocket {
                                     Some(c) => c.eq_ignore_ascii_case("wav"),
                                     None => false,
                                 };
-                                let default_rate = if is_wav { 24_000 } else { last_known_rate };
+                                let is_multilingual = {
+                                    let l = lang.to_lowercase();
+                                    ["es", "fr", "zh", "de", "ar", "pt", "ru", "kn"].iter().any(|&prefix| l.starts_with(prefix))
+                                };
+                                let default_rate = if is_wav || is_multilingual { 24_000 } else { last_known_rate };
                                 let chunk_rate = match sample_rate {
                                     Some(sr) if sr > 0 => sr,
                                     _ => default_rate,

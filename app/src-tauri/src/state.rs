@@ -227,6 +227,9 @@ impl AppState {
                 if let Some(ref t) = target_lang {
                     *call.target_lang.write() = t.clone();
                 }
+                // Discard lingering audio from previous language immediately
+                call.audio.jitter().clear();
+                call.audio.jitter().flush_resamplers().await;
                 let cur_voice = call.voice.read().clone();
                 let cur_tone = call.tone.read().clone();
                 call.relay

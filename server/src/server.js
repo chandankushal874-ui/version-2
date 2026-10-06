@@ -504,6 +504,10 @@ wss.on('connection', (ws, req) => {
         client.session.targetLang = tgt;
         log.info(`${client.session.userId} changed langs ${src} → ${tgt}`);
 
+        client.reconnectBuffer = [];
+        if (client._flushTimer) { clearInterval(client._flushTimer); client._flushTimer = null; }
+        client._handledUtterances?.clear();
+
         // Re-open THIS participant's upstream with the new multi-target set.
         try { client.upstream?.close(); } catch { /* ignore */ }
         const newTargets = computeTargets(client.room, client.session.sessionId, tgt);
@@ -986,7 +990,6 @@ export function forwardOllalinkToRoom(client, evt) {
   // -------- AUDIO (spoken translated voice) --------
   if (evt.kind === 'audio') {
     const p = evt.payload;
-    if (p?.utteranceId && client._handledUtterances?.has(p.utteranceId)) return;
     // End-of-utterance marker has pcm=null. Skip binary forward, but emit a
     // marker so peers can flush their playback.
     const marker = p.last === true && !p.pcm;
@@ -1018,10 +1021,11 @@ export function forwardOllalinkToRoom(client, evt) {
         }
       }
 
-      // Sample rate resolution:
-      // Streaming PCM defaults to 48000 Hz; batch WAV containers default to 24000 Hz.
+      // Sample rate guarantee:
+      // Multilingual target languages (es, fr, zh, de, ar, pt, ru, kn) run at 24000 Hz.
       const finalCodec = p.codec || 'pcm_s16le';
-      const defaultRate = (finalCodec === 'wav') ? 24000 : 48000;
+      const isMultilingualVoice = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn'].includes(peerCanon || pCanon);
+      const defaultRate = (finalCodec === 'wav' || isMultilingualVoice) ? 24000 : 48000;
       const finalRate = p.sampleRate || p.sample_rate || defaultRate;
 
       try {

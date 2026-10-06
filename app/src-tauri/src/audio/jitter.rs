@@ -346,6 +346,14 @@ impl JitterPlayer {
         !self.ring.lock().is_empty()
     }
 
+    /// Clear the playback buffer on mid-call language switch or reset.
+    pub fn clear(&self) {
+        self.ring.lock().clear();
+        self.playing.store(false, Ordering::Release);
+        self.consecutive_empty.store(0, Ordering::Relaxed);
+        self.waiting_callbacks.store(0, Ordering::Relaxed);
+    }
+
     /// Enable or disable speaker audio output mid-call.
     pub fn set_speaker_muted(&self, muted: bool) {
         self.speaker_muted.store(muted, Ordering::Relaxed);
