@@ -4,8 +4,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-const RENDER_BASE = process.env.RELAY_URL || 'https://windows-live-translation-app-1.onrender.com';
-const RENDER_WS = process.env.RELAY_WS_URL || 'wss://windows-live-translation-app-1.onrender.com/call';
+const RENDER_BASE = process.env.RELAY_URL || 'https://windows-live-translation-app-lzx2.onrender.com';
+const RENDER_WS = process.env.RELAY_WS_URL || 'wss://windows-live-translation-app-lzx2.onrender.com/call';
 const AUDIO_INPUT = process.env.AUDIO_INPUT || path.join(os.tmpdir(), 'input_english_voice_sent_to_gpu.wav');
 const PROOF_OUTPUT = process.env.PROOF_OUTPUT || path.join(os.tmpdir(), 'proof_live_render_relay_transferred_hindi.wav');
 
@@ -112,7 +112,7 @@ async function run() {
     if (isBinary) {
       const buf = Buffer.from(data);
       receivedAudioChunks.push(buf);
-      console.log(`      🔊 [Bob received audio binary chunk #${receivedAudioChunks.length}]: ${buf.length} bytes`);
+      console.log(`      ?? [Bob received audio binary chunk #${receivedAudioChunks.length}]: ${buf.length} bytes`);
       return;
     }
 
@@ -126,7 +126,7 @@ async function run() {
       } else if (msg.type === 'caption') {
         const p = msg.payload;
         if (p?.text) {
-          console.log(`      💬 [Bob received caption ${msg.kind}]: "${p.text}"`);
+          console.log(`      ?? [Bob received caption ${msg.kind}]: "${p.text}"`);
           if (msg.kind === 'translation') {
             receivedTranslations.push(p.text);
           } else {
@@ -135,7 +135,7 @@ async function run() {
         }
       } else if (msg.type === 'audio') {
         lastAudioMeta = msg;
-        console.log(`      🎵 [Bob received audio header]: lang=${msg.lang}, rate=${msg.sampleRate}Hz, seq=${msg.chunkSeq}, last=${msg.last}`);
+        console.log(`      ?? [Bob received audio header]: lang=${msg.lang}, rate=${msg.sampleRate}Hz, seq=${msg.chunkSeq}, last=${msg.last}`);
       } else if (msg.type === 'error') {
         console.warn('      [Bob received error]:', msg);
       }
@@ -170,7 +170,7 @@ async function run() {
     chunkCount++;
     const chunk = pcmData.subarray(offset, Math.min(offset + chunkSize, pcmData.length));
     aliceWs.send(chunk);
-    console.log(`      🎙️ Alice sent audio chunk ${chunkCount} (${chunk.length} bytes)...`);
+    console.log(`      ??? Alice sent audio chunk ${chunkCount} (${chunk.length} bytes)...`);
     await new Promise(r => setTimeout(r, 500)); // Natural 500ms speech streaming cadence
   }
 
@@ -203,7 +203,7 @@ async function run() {
     const wavHeader = writeWavHeader(sampleRate, 1, 16, totalPcm.length);
     const finalWav = Buffer.concat([wavHeader, totalPcm]);
     fs.writeFileSync(PROOF_OUTPUT, finalWav);
-    console.log(`\n✨ [PROOF SAVED]: ${PROOF_OUTPUT}`);
+    console.log(`\n? [PROOF SAVED]: ${PROOF_OUTPUT}`);
     console.log(`   File size: ${(finalWav.length / 1024).toFixed(1)} KB`);
     console.log(`   Duration:  ${(totalPcm.length / (sampleRate * 2)).toFixed(2)} seconds of spoken translated audio`);
   } else {

@@ -1,20 +1,14 @@
 @echo off
 title Ollalink Translate Release Launcher
 echo ========================================================
-echo   Ollalink Translate - Release Runner
+echo   Ollalink Translate - Cloud Relay Mode (Render)
 echo ========================================================
 echo.
-echo [0/2] Unblocking files from Smart App Control / SmartScreen...
+echo [1/2] Unblocking files from Smart App Control / SmartScreen...
 powershell -NoProfile -Command "Get-ChildItem -Path '%~dp0' -Recurse | Unblock-File" 2>nul
 
-echo [1/2] Starting Node.js Relay Server (Port 8787)...
-start "Ollalink Relay Server" cmd /c "cd /d "%~dp0server" && npm start"
-
-echo [2/2] Waiting for relay to become ready...
-timeout /t 2 /nobreak >nul
-
 echo.
-echo Launching Compiled Ollalink Translate Desktop App...
+echo [2/2] Launching Ollalink Translate Desktop App (Connected to Cloud Relay)...
 if exist "%~dp0ollalink-translate.exe" (
     start "" "%~dp0ollalink-translate.exe"
 ) else (

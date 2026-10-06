@@ -1,5 +1,5 @@
 /**
- * config.js — environment loading and validation.
+ * config.js � environment loading and validation.
  *
  * Senior Engineering & Cloud-Native Hardened Configuration:
  * - Auto-resolves Render / Railway / Cloud environment variables
@@ -33,7 +33,7 @@ if (!process.env.PUBLIC_BASE || (process.env.RENDER_EXTERNAL_HOSTNAME && (proces
   } else if (process.env.RAILWAY_PUBLIC_DOMAIN) {
     process.env.PUBLIC_BASE = `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
   } else if (process.env.NODE_ENV === 'production') {
-    process.env.PUBLIC_BASE = 'https://windows-live-translation-app-1.onrender.com';
+    process.env.PUBLIC_BASE = 'https://windows-live-translation-app-lzx2.onrender.com';
   } else {
     process.env.PUBLIC_BASE = `http://localhost:${process.env.PORT}`;
   }

@@ -41,3 +41,5 @@ app/ui/src/*.js
 !server/**/*.js
 
 Screenshots/
+
+scratch/

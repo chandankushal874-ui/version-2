@@ -500,9 +500,9 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
 
     case 'mint_session': {
       let relay = String(args?.relayUrl || '');
-      let httpBase = relay ? relay.trim().replace(/^ws(s)?:/, 'http$1:').replace(/\/call\/?$/, '').replace(/\/+$/, '') : (window.location.origin?.startsWith('http') ? window.location.origin : 'https://windows-live-translation-app-1.onrender.com');
+      let httpBase = relay ? relay.trim().replace(/^ws(s)?:/, 'http$1:').replace(/\/call\/?$/, '').replace(/\/+$/, '') : (window.location.origin?.startsWith('http') ? window.location.origin : 'https://windows-live-translation-app-lzx2.onrender.com');
       if (!httpBase.startsWith('http')) {
-        httpBase = window.location.origin?.startsWith('http') ? window.location.origin : 'https://windows-live-translation-app-1.onrender.com';
+        httpBase = window.location.origin?.startsWith('http') ? window.location.origin : 'https://windows-live-translation-app-lzx2.onrender.com';
       }
       try {
         const res = await fetch(`${httpBase}/api/session`, {

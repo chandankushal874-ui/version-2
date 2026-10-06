@@ -1,1 +1,3 @@
-5C7C4DADEC0CB2A83EA25A34EEC592C132B17A4050C1A26104AFDCEE7D29370B  Ollalink-Translate-Windows-x64.zip
+f1f49ac0d232cb38741f634db4c2e95c8acdd1b1ee9e6938b239aa707257d775  ollalink-translate.exe
+847ce32a3d8b0b0283a549ec5e8737ef63d959a611953ab8a9e1a68f72dc2b6b  Ollalink-Translate-Setup.exe
+fd46267559539db8052ef9695cd612e79a3b4bce4f87fd52e96e48ea9efe590b  Ollalink-Translate-Windows-x64.zip

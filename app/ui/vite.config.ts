@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+﻿import { defineConfig } from 'vite';
 
 export default defineConfig({
   server: {
@@ -13,12 +13,12 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       '/api': {
-        target: process.env.VITE_RELAY_URL || 'https://windows-live-translation-app-1.onrender.com',
+        target: process.env.VITE_RELAY_URL || 'https://windows-live-translation-app-lzx2.onrender.com',
         changeOrigin: true,
         secure: false,
       },
       '/call': {
-        target: (process.env.VITE_RELAY_URL || 'https://windows-live-translation-app-1.onrender.com').replace(/^http(s)?:/i, 'ws$1:'),
+        target: (process.env.VITE_RELAY_URL || 'https://windows-live-translation-app-lzx2.onrender.com').replace(/^http(s)?:/i, 'ws$1:'),
         ws: true,
         changeOrigin: true,
       },

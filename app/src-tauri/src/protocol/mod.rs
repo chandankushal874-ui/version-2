@@ -37,6 +37,8 @@ pub enum ServerEvent {
         has_binary: Option<bool>,
         #[serde(rename = "utteranceId")]
         utterance_id: Option<String>,
+        #[serde(rename = "audio_b64", alias = "audioB64", default)]
+        audio_b64: Option<String>,
     },
     Caption {
         kind: CaptionKind,
@@ -182,3 +184,4 @@ mod tests {
         assert_eq!(res.unwrap_err(), "room-full: room is full");
     }
 }
+

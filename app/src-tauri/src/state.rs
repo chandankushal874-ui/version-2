@@ -130,6 +130,18 @@ impl AppState {
         self.speaker_muted.load(Ordering::Relaxed)
     }
 
+    pub async fn push_inbound_audio(&self, bytes: Vec<u8>, sample_rate: u32, is_last: bool) {
+        let guard = self.active.lock().await;
+        if let Some(call) = guard.as_ref() {
+            if !bytes.is_empty() {
+                call.audio.jitter().push_audio_with_rate(&bytes, sample_rate).await;
+            }
+            if is_last {
+                call.audio.jitter().flush_resamplers().await;
+            }
+        }
+    }
+
     pub fn set_input_volume(&self, v: f32) {
         let clamped = v.clamp(0.0, 2.0);
         self.input_volume.store(clamped.to_bits(), Ordering::Relaxed);

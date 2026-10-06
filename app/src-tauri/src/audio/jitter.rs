@@ -206,9 +206,7 @@ impl JitterPlayer {
         let overflow = ring.len() + resampled.len();
         if overflow > cap {
             let to_remove = (overflow - cap).min(ring.len());
-            for _ in 0..to_remove {
-                ring.pop_front();
-            }
+            ring.drain(0..to_remove);
         }
         ring.extend(resampled.iter().copied());
     }
@@ -243,7 +241,7 @@ impl JitterPlayer {
             }
         }
 
-        let ch = self.out_channels.load(Ordering::Relaxed);
+        let ch = self.out_channels.load(Ordering::Relaxed).max(1);
         let speaker_muted = self.speaker_muted.load(Ordering::Relaxed);
         let mut i = 0;
         while i < needed {
@@ -297,10 +295,12 @@ impl JitterPlayer {
             let out_rate = self.out_rate.load(Ordering::Relaxed);
             let cap = (out_rate as usize) * 12;
             let mut ring = self.ring.lock();
-            for s in flushed_all {
-                if ring.len() >= cap { ring.pop_front(); }
-                ring.push_back(s);
+            let overflow = ring.len() + flushed_all.len();
+            if overflow > cap {
+                let to_remove = (overflow - cap).min(ring.len());
+                ring.drain(0..to_remove);
             }
+            ring.extend(flushed_all);
         }
 
         // Clock drift compensation for long sessions:
@@ -352,6 +352,7 @@ impl JitterPlayer {
     }
 
     /// Check if speaker audio output is currently muted.
+    #[allow(dead_code)]
     pub fn is_speaker_muted(&self) -> bool {
         self.speaker_muted.load(Ordering::Relaxed)
     }
@@ -605,6 +606,7 @@ mod tests {
         let pcm24 = vec![0u8; 480];
         player.push_audio_with_rate(&pcm24, 24_000).await;
 
+        player.flush_resamplers().await;
         // 24kHz -> 48kHz resampler expands 2x: exactly 480 samples
         let count = player.ring.lock().len();
         assert!((count as i32 - 480).abs() <= 1, "24kHz audio must resample ~2x (got {}) to 48kHz cleanly without chipmunk pitch!", count);
@@ -669,3 +671,4 @@ mod tests {
         assert!(has_non_zero, "Unmuted speaker must output real audio samples immediately");
     }
 }
+

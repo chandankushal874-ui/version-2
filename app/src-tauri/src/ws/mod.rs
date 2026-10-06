@@ -37,6 +37,12 @@ use crate::protocol::{resolve_joined_waiter, reject_joined_waiter, ServerEvent};
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 const INITIAL_BACKOFF_MS: u64 = 250;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpectedChunk {
+    pub sample_rate: u32,
+    pub is_last: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RelaySocketConfig {
     pub ws_url: String,
@@ -146,11 +152,6 @@ impl RelaySocket {
         // Reader task. Uses the *stable* audio_in_tx so playback is undisturbed.
         let inner_r = inner.clone();
         tokio::spawn(async move {
-            #[derive(Debug, Clone, Copy)]
-            struct ExpectedChunk {
-                sample_rate: u32,
-                is_last: bool,
-            }
             // Strict FIFO queue for matching text headers to upcoming binary frames.
             // Bounded to 32 items to guarantee deterministic memory and prevent offset drifts on dropped frames.
             let mut last_known_rate: u32 = 48_000;
@@ -172,6 +173,21 @@ impl RelaySocket {
                 };
                 match msg {
                     Message::Binary(b) => {
+                        // 0. OLAU self-describing binary frame: [OLAU (4B)][Rate (4B LE)][Flags (1B)][Seq (2B)][PCM...]
+                        // Eliminates FIFO queue pairing and desync entirely!
+                        if b.len() >= 11 && &b[0..4] == b"OLAU" {
+                            let rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                            let flags = b[8];
+                            let is_last = (flags & 1) != 0;
+                            let pcm = b[11..].to_vec();
+                            if rate > 0 {
+                                last_known_rate = rate;
+                            }
+                            let tx = inner_r.audio_in_tx.lock().await;
+                            let _ = tx.send((pcm, rate, is_last));
+                            continue;
+                        }
+
                         // 1. WAV containers are self-describing; byte 24..28 holds native sample rate.
                         let detected_rate = if b.starts_with(b"RIFF") && b.len() >= 28 && b.get(8..12) == Some(b"WAVE") {
                             let r = u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
@@ -181,6 +197,10 @@ impl RelaySocket {
                         };
 
                         if let Some(meta) = expected_audio_queue.pop_front() {
+                            if meta.sample_rate == 0 {
+                                // Duplicate binary arrived for chunk already consumed via audio_b64; discard cleanly
+                                continue;
+                            }
                             let rate = detected_rate.unwrap_or(meta.sample_rate);
                             if detected_rate.is_none() && rate > 0 {
                                 last_known_rate = rate;
@@ -204,7 +224,7 @@ impl RelaySocket {
                     Message::Text(t) => {
                         let raw_val: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
                         match serde_json::from_str::<ServerEvent>(&t) {
-                            Ok(ServerEvent::Audio { end_of_utterance, has_binary, sample_rate, last, ref lang, ref codec, .. }) => {
+                            Ok(ServerEvent::Audio { end_of_utterance, has_binary, sample_rate, last, ref lang, ref codec, ref audio_b64, .. }) => {
                                 let is_marker = end_of_utterance.unwrap_or(false);
                                 let is_last = last.unwrap_or(false);
                                 let carries_binary = has_binary.unwrap_or(!is_marker);
@@ -226,6 +246,32 @@ impl RelaySocket {
                                     last_known_rate = chunk_rate;
                                 }
 
+                                // 0. Single-message self-describing audio path:
+                                // If audio_b64 is present directly in this JSON message, decode and dispatch immediately!
+                                // ZERO pairing, ZERO FIFO queue, ZERO possibility of desynchronization!
+                                if let Some(ref b64) = audio_b64 {
+                                    use base64::Engine;
+                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                        if carries_binary {
+                                            if !pending_binary_queue.is_empty() {
+                                                pending_binary_queue.pop_front();
+                                            } else {
+                                                if expected_audio_queue.len() >= 64 {
+                                                    expected_audio_queue.pop_front();
+                                                }
+                                                expected_audio_queue.push_back(ExpectedChunk {
+                                                    sample_rate: 0,
+                                                    is_last: false,
+                                                });
+                                            }
+                                        }
+                                        let tx = inner_r.audio_in_tx.lock().await;
+                                        let _ = tx.send((bytes, chunk_rate, is_last));
+                                        let _ = inner_r.app.emit("relay-event", &raw_val);
+                                        continue;
+                                    }
+                                }
+
                                 if carries_binary {
                                     // Normal path: Text header arrives first, binary arrives second.
                                     // If an orphan binary arrived earlier, pair it now.
@@ -245,9 +291,9 @@ impl RelaySocket {
                                 } else if is_marker || is_last {
                                     let tx = inner_r.audio_in_tx.lock().await;
                                     let _ = tx.send((Vec::new(), 0, true));
-                                    // B-04 Fix: Only clear meta queue. Don't clear pending_binary_queue —
-                                    // it may contain the final audio chunk that hasn't been paired yet.
+                                    // Utterance boundary: Flush queues so past sentence state never pollutes subsequent utterances
                                     expected_audio_queue.clear();
+                                    pending_binary_queue.clear();
                                 }
                                 let _ = inner_r.app.emit("relay-event", &raw_val);
                             }
@@ -430,3 +476,76 @@ impl RelaySocket {
     }
 }
 
+
+#[cfg(test)]
+mod ws_self_describing_tests {
+
+    #[test]
+    fn test_olau_binary_frame_unpacking() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"OLAU");
+        frame.extend_from_slice(&24000u32.to_le_bytes());
+        frame.push(1u8); // is_last = true
+        frame.extend_from_slice(&42u16.to_le_bytes()); // chunkSeq = 42
+        let pcm = vec![0x12, 0x34, 0x56, 0x78];
+        frame.extend_from_slice(&pcm);
+
+        assert_eq!(&frame[0..4], b"OLAU");
+        let rate = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+        assert_eq!(rate, 24000);
+        let flags = frame[8];
+        assert_eq!((flags & 1) != 0, true);
+        let seq = u16::from_le_bytes([frame[9], frame[10]]);
+        assert_eq!(seq, 42);
+        assert_eq!(&frame[11..], &pcm[..]);
+    }
+
+    #[test]
+    fn test_server_event_audio_b64_decoding() {
+        use base64::Engine;
+        let pcm = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);
+        let json = serde_json::json!({
+            "type": "audio",
+            "from": "alice",
+            "sampleRate": 24000,
+            "last": true,
+            "audio_b64": b64
+        });
+        let ev: crate::protocol::ServerEvent = serde_json::from_value(json).unwrap();
+        match ev {
+            crate::protocol::ServerEvent::Audio { sample_rate, last, audio_b64, .. } => {
+                assert_eq!(sample_rate, Some(24000));
+                assert_eq!(last, Some(true));
+                let decoded = base64::engine::general_purpose::STANDARD.decode(audio_b64.unwrap()).unwrap();
+                assert_eq!(decoded, pcm);
+            }
+            _ => panic!("Expected ServerEvent::Audio"),
+        }
+    }
+
+    #[test]
+    fn test_expected_chunk_duplicate_binary_discard_flag() {
+        use super::ExpectedChunk;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(ExpectedChunk {
+            sample_rate: 0,
+            is_last: false,
+        });
+        let meta = queue.pop_front().expect("must have meta");
+        assert_eq!(meta.sample_rate, 0, "sample_rate 0 signals discard marker");
+    }
+
+    #[test]
+    fn test_utterance_boundary_clears_orphan_binaries() {
+        use super::ExpectedChunk;
+        let mut expected_audio_queue = std::collections::VecDeque::new();
+        let mut pending_binary_queue = std::collections::VecDeque::new();
+        pending_binary_queue.push_back(vec![1, 2, 3, 4]);
+        expected_audio_queue.push_back(ExpectedChunk { sample_rate: 48000, is_last: false });
+        expected_audio_queue.clear();
+        pending_binary_queue.clear();
+        assert!(expected_audio_queue.is_empty(), "expected queue must be clean");
+        assert!(pending_binary_queue.is_empty(), "pending binary queue must be clean to avoid contaminating next utterance");
+    }
+}

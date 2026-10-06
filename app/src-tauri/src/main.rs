@@ -17,6 +17,13 @@ use tracing_subscriber::EnvFilter;
 static RELAY_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 
 fn try_spawn_local_relay() {
+    // By default, Ollalink Translate connects directly to the Cloud Relay on Render.
+    // Local Node.js relay is only spawned if explicitly requested via environment variable:
+    // OLLALINK_LOCAL_RELAY=1
+    if std::env::var("OLLALINK_LOCAL_RELAY").unwrap_or_default() != "1" {
+        return;
+    }
+
     if std::net::TcpStream::connect("127.0.0.1:8787").is_ok() {
         tracing::info!("Local relay already running on port 8787");
         return;
@@ -253,6 +260,7 @@ fn main() {
             commands::change_languages,
             commands::update_voice_settings,
             commands::check_relay_health,
+            commands::play_audio_chunk,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -396,28 +404,31 @@ pub mod commands {
 
     /// Probe relay health bypassing webview CORS.
     #[tauri::command]
-    pub async fn check_relay_health(relay_url: String) -> Result<bool, String> {
-        let mut base = relay_url.trim().to_string();
-        if !base.starts_with("http://") && !base.starts_with("https://") && !base.starts_with("ws://") && !base.starts_with("wss://") {
-            if base.starts_with("localhost") || base.starts_with("127.0.0.1") {
-                base = format!("http://{}", base);
-            } else {
-                base = format!("https://{}", base);
-            }
-        }
-        let base = base.replace("wss://", "https://").replace("ws://", "http://");
-        let base = base.trim_end_matches("/call").trim_end_matches('/');
+        pub async fn check_relay_health(relay_url: String) -> Result<bool, String> {
+        let base = relay_url.trim().trim_end_matches('/');
         let url = format!("{}/api/health", base);
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(6))
-            .build() {
-                Ok(c) => c,
-                Err(e) => return Err(e.to_string()),
-            };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1500))
+            .build()
+            .map_err(|e| e.to_string())?;
         match client.get(&url).send().await {
             Ok(res) => Ok(res.status().is_success()),
             Err(_) => Ok(false),
         }
+    }
+
+    #[tauri::command]
+    pub async fn play_audio_chunk(
+        state: State<'_, AppState>,
+        pcm_base64: String,
+        sample_rate: u32,
+        is_last: bool,
+    ) -> Result<(), String> {
+        use base64::Engine;
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&pcm_base64) {
+            state.push_inbound_audio(bytes, sample_rate, is_last).await;
+        }
+        Ok(())
     }
 
     #[derive(Debug, Serialize)]

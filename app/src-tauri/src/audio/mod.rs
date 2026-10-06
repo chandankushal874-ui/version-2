@@ -46,6 +46,7 @@ pub struct AudioPipelineConfig {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub sample_rate: u32,
+    #[allow(dead_code)]
     pub frame_ms: u32,
     pub jitter_buffer_ms: u32,
 }
@@ -164,6 +165,10 @@ impl AudioPipeline {
 
     pub fn set_speaker_muted(&self, muted: bool) {
         self.jitter.set_speaker_muted(muted);
+    }
+
+    pub fn jitter(&self) -> Arc<JitterPlayer> {
+        self.jitter.clone()
     }
 
     pub async fn stop(&self) {

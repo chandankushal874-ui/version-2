@@ -1,10 +1,10 @@
-//! prefs.rs — durable user preferences.
+//! prefs.rs - durable user preferences.
 //!
 //! Stores relay URL, display name, languages, and device choices in
 //! `%APPDATA%\com.ollalink.translate\prefs.json` on Windows, so the user
 //! doesn't have to re-enter them every launch.
 //!
-//! Schema is versioned — bump VERSION on breaking changes and discard old files.
+//! Schema is versioned - bump VERSION on breaking changes and discard old files.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 const VERSION: u32 = 1;
 const FILENAME: &str = "prefs.json";
+pub const PRODUCTION_RELAY_URL: &str = "https://windows-live-translation-app-lzx2.onrender.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -33,7 +34,7 @@ impl UserPrefs {
         Self {
             version: VERSION,
             display_name: String::new(),
-            relay_url: "http://localhost:8787".into(),
+            relay_url: PRODUCTION_RELAY_URL.into(),
             source_lang: "auto".into(),
             target_lang: "hi".into(),
             voice_persona: "nh-m01".into(),
@@ -58,8 +59,19 @@ pub fn load() -> UserPrefs {
         let parsed: UserPrefs = serde_json::from_str(&raw)?;
         Ok::<_, anyhow::Error>(parsed)
     }) {
-        Ok(p) if p.version == VERSION => p,
-        Ok(_) => UserPrefs::with_defaults(), // version mismatch — reset
+        Ok(mut p) if p.version == VERSION => {
+            // Auto-upgrade legacy localhost/127.0.0.1 or old Render relays to active production cloud relay (lzx2)
+            if p.relay_url.is_empty()
+                || p.relay_url.contains("localhost")
+                || p.relay_url.contains("127.0.0.1")
+                || p.relay_url.contains("windows-live-translation-app-1")
+            {
+                p.relay_url = PRODUCTION_RELAY_URL.into();
+                let _ = save(&p);
+            }
+            p
+        }
+        Ok(_) => UserPrefs::with_defaults(), // version mismatch - reset
         Err(_) => UserPrefs::with_defaults(),
     }
 }

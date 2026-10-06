@@ -1,20 +1,20 @@
-﻿/**
- * server.js â€” relay entrypoint.
+/**
+ * server.js — relay entrypoint.
  *
  * Surfaces:
- *   POST /api/session        â€” mint a session token (JSON body)
- *   GET  /api/health         â€” liveness
- *   GET  /api/stats          â€” room/participant counts
- *   WS   /call               â€” the call data plane (binary + JSON frames)
+ *   POST /api/session        — mint a session token (JSON body)
+ *   GET  /api/health         — liveness
+ *   GET  /api/stats          — room/participant counts
+ *   WS   /call               — the call data plane (binary + JSON frames)
  *
  * Client WS frame protocol (JSON or Binary):
  *   { "type": "join", "token": "...", "room": "ABC12", "displayName": "Alice" }
- *       â†’ server replies { type: "joined", room, self, participants[] }
+ *       → server replies { type: "joined", room, self, participants[] }
  *   { "type": "leave" }
- *   <binary PCM frame> â€” forwarded upstream to Ollalink
- *   { "type": "ping" } â†’ { type: "pong" }
+ *   <binary PCM frame> — forwarded upstream to Ollalink
+ *   { "type": "ping" } → { type: "pong" }
  *
- * Server â†’ client frames:
+ * Server → client frames:
  *   { type: "joined", ... } | { type: "peer-joined", ... } | { type: "peer-left", ... }
  *   { type: "audio", "from": sessionId } + binary frame (next message carries PCM)
  *   { type: "caption", "kind": "partial"|"final"|"translation", ...payload }
@@ -24,6 +24,7 @@
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { config, log } from './config.js';
+import { translateText, synthesizeSpeech } from './tts-fallback.js';
 import { mintSession, verifySession } from './auth.js';
 import { createRoom, getRoom, joinRoom, leaveRoom, others, roomStats, isValidRoomCode, startRoomSweeper } from './rooms.js';
 import { openOllalinkStream, probeOllalinkLanguage } from './ollalink.js';
@@ -81,7 +82,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html>
 <html>
-<head><title>Ollalink Translate Relay — Online</title>
+<head><title>Ollalink Translate Relay � Online</title>
 <style>
 body { font-family: system-ui, -apple-system, sans-serif; background: #0c0e14; color: #e2e8f0; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
 .card { background: #171b26; border: 1px solid #2d3748; padding: 2.5rem; border-radius: 1rem; text-align: center; max-width: 480px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
@@ -117,7 +118,7 @@ p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; margin: 0 0 1.5rem 0; 
     return res.end(JSON.stringify(roomStats()));
   }
 
-  // Public language catalog â€” the UI consumes this so it doesn't drift from server.
+  // Public language catalog — the UI consumes this so it doesn't drift from server.
   if (req.method === 'GET' && url.pathname === '/api/langs') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({
@@ -175,7 +176,7 @@ p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; margin: 0 0 1.5rem 0; 
           return res.end(JSON.stringify({ error: 'userId too long' }));
         }
         // Validate languages against the server-side catalog. Defaults reject
-        // unsupported pairs early â€” cheaper than learning at WS-open time.
+        // unsupported pairs early — cheaper than learning at WS-open time.
         const src = normalizeLang(sourceLang, 'source');
         const tgt = normalizeLang(targetLang, 'target');
         if (!src) {
@@ -219,7 +220,7 @@ p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; margin: 0 0 1.5rem 0; 
     return;
   }
 
-  // Explicit token refresh endpoint. Body: { token } â€” must be valid, returns a
+  // Explicit token refresh endpoint. Body: { token } — must be valid, returns a
   // new token for the same user with a fresh expiry.
   if (req.method === 'POST' && url.pathname === '/api/session/refresh') {
     let body = '';
@@ -322,6 +323,7 @@ wss.on('connection', (ws, req) => {
     room: null,
     upstream: null, // Ollalink stream handle
     isAlive: true,
+    _handledUtterances: new Set(),
   };
   clientRegistry.set(ws, client);
 
@@ -365,7 +367,7 @@ wss.on('connection', (ws, req) => {
           oldSessionId: oldSid,
           newSessionId: newPayload.sid,
         });
-        log.info(`session rotated for ${newPayload.sub} ${oldSid} â†’ ${newPayload.sid}`);
+        log.info(`session rotated for ${newPayload.sub} ${oldSid} → ${newPayload.sid}`);
         ws.send(JSON.stringify({
           type: 'session.refreshed',
           sessionId: newPayload.sid,
@@ -425,7 +427,7 @@ wss.on('connection', (ws, req) => {
         // Compute the union of all OTHER participants' target languages, plus
         // any future joiners will be added via session refresh (sound-stream
         // doesn't yet support adding targets mid-session, so we re-open when
-        // the peer set changes â€” see broadcastToOthers for lang recompute).
+        // the peer set changes — see broadcastToOthers for lang recompute).
         const initialTargets = computeTargets(room, sessionPayload.sid, sessionPayload.tgt);
         client.upstream = bindUpstream(client,
           {
@@ -474,7 +476,7 @@ wss.on('connection', (ws, req) => {
       }
 
       // Toggle captions on/off for THIS participant. Affects only whether caption
-      // events are echoed back to them â€” peers still get their own captions per
+      // events are echoed back to them — peers still get their own captions per
       // their own setting.
       // Bug 25 Fix: Accept both captions.set and captions-toggle
       if (msg.type === 'captions.set' || msg.type === 'captions-toggle') {
@@ -500,7 +502,7 @@ wss.on('connection', (ws, req) => {
         const oldTgt = client.session.targetLang;
         client.session.sourceLang = src;
         client.session.targetLang = tgt;
-        log.info(`${client.session.userId} changed langs ${src} â†’ ${tgt}`);
+        log.info(`${client.session.userId} changed langs ${src} → ${tgt}`);
 
         // Re-open THIS participant's upstream with the new multi-target set.
         try { client.upstream?.close(); } catch { /* ignore */ }
@@ -962,12 +964,21 @@ function broadcastToOthers(client, msg) {
  * Route an upstream Ollalink event for `client` to the right listeners.
  *
  * Sound-stream can fan out one speaker to multiple target languages in a
- * single upstream session. Each `audio` event carries a `language` field â€”
+ * single upstream session. Each `audio` event carries a `language` field —
  * route it to the peer whose targetLang matches.
  *
  * Captions similarly carry a `language` (target) for translation events and
  * the source language for transcript events. We honor `captionsOn` per peer.
  */
+
+function recordHandledUtterance(client, uid) {
+  if (!client._handledUtterances) client._handledUtterances = new Set();
+  client._handledUtterances.add(uid);
+  if (client._handledUtterances.size > 200) {
+    const first = client._handledUtterances.values().next().value;
+    if (first) client._handledUtterances.delete(first);
+  }
+}
 
 export function forwardOllalinkToRoom(client, evt) {
   if (!client.session || !client.room) return;
@@ -978,6 +989,7 @@ export function forwardOllalinkToRoom(client, evt) {
     // End-of-utterance marker has pcm=null. Skip binary forward, but emit a
     // marker so peers can flush their playback.
     const marker = p.last === true && !p.pcm;
+    if (p.utteranceId) recordHandledUtterance(client, p.utteranceId);
 
     const peers = Array.from(others(client.room.code, client.session.sessionId));
     // Self-monitor audio return is disabled when alone (prevents acoustic feedback loop and self-echo)
@@ -1039,6 +1051,144 @@ export function forwardOllalinkToRoom(client, evt) {
     payload: evt.payload,
   });
 
+  // Fallback Neural Translation & TTS Engine:
+  // When Ollalink chat-translation fails or reports TranslationUnavailable,
+  // automatically translate and synthesize 48kHz native voice for peers.
+  // Immediate synthesis on translation_error
+  if (evt.kind === 'error' && evt.payload?.code === 'translation_error') {
+    const utteranceId = evt.payload?.utterance_id || client._lastFinalUtteranceId;
+    const textToSpeak = client._lastFinalTranscript;
+    if (utteranceId && textToSpeak && !client._handledUtterances?.has(utteranceId)) {
+      recordHandledUtterance(client, utteranceId);
+      const peers = Array.from(others(client.room?.code, client.session?.sessionId));
+      for (const peer of peers) {
+        const targetWs = peer.ws;
+        if (!targetWs || targetWs.readyState !== 1) continue;
+        const peerTarget = canonicalLang(peer.targetLang) || 'en';
+        (async () => {
+          try {
+            log.info(`[tts-fallback-immediate] synthesizing voice on error for ${client.session.displayName} -> ${peer.displayName} (${peerTarget})`);
+            const translated = await translateText(textToSpeak, peerTarget);
+            targetWs.send(JSON.stringify({
+              type: 'caption',
+              kind: 'translation',
+              from: client.session.sessionId,
+              payload: {
+                type: 'translation.final',
+                utterance_id: utteranceId,
+                text: translated,
+                target: peerTarget,
+              },
+            }));
+            let seq = 0;
+            await synthesizeSpeech(translated, peerTarget, peer.session.voice || 'default', (chunk, isLast) => {
+              if (targetWs.readyState !== 1) return;
+              if (chunk) {
+                targetWs.send(JSON.stringify({
+                  type: 'audio',
+                  from: client.session.sessionId,
+                  lang: peerTarget,
+                  codec: 'pcm_s16le',
+                  sampleRate: 48000,
+                  chunkSeq: seq++,
+                  last: false,
+                  hasBinary: true,
+                  utteranceId,
+                }));
+                targetWs.send(chunk, { binary: true });
+              } else if (isLast) {
+                targetWs.send(JSON.stringify({
+                  type: 'audio',
+                  from: client.session.sessionId,
+                  lang: peerTarget,
+                  codec: 'pcm_s16le',
+                  sampleRate: 48000,
+                  last: true,
+                  endOfUtterance: true,
+                  hasBinary: false,
+                  utteranceId,
+                }));
+              }
+            });
+          } catch (err) {
+            log.warn(`[tts-fallback-immediate] error: ${err.message}`);
+          }
+        })();
+      }
+    }
+  }
+
+  if (evt.kind === 'caption-final' && evt.payload?.text) {
+    const finalTranscript = evt.payload.text;
+    const utteranceId = evt.payload.utterance_id || ('u_' + Date.now());
+    client._lastFinalTranscript = finalTranscript;
+    client._lastFinalUtteranceId = utteranceId;
+    const peers = Array.from(others(client.room.code, client.session.sessionId));
+
+    if (peers.length > 0) {
+      setTimeout(async () => {
+        if (client._handledUtterances?.has(utteranceId)) return;
+        recordHandledUtterance(client, utteranceId);
+
+        for (const peer of peers) {
+          const targetWs = peer.ws;
+          if (!targetWs || targetWs.readyState !== 1) continue;
+          const peerTarget = canonicalLang(peer.targetLang) || 'en';
+
+          try {
+            log.info(`[tts-fallback] synthesizing voice for ${client.session.displayName} -> ${peer.displayName} (${peerTarget})`);
+            const translated = await translateText(finalTranscript, peerTarget);
+
+            targetWs.send(JSON.stringify({
+              type: 'caption',
+              kind: 'translation',
+              from: client.session.sessionId,
+              payload: {
+                type: 'translation.final',
+                utterance_id: utteranceId,
+                text: translated,
+                target: peerTarget,
+              },
+            }));
+
+            let seq = 0;
+            await synthesizeSpeech(translated, peerTarget, peer.session.voice || 'default', (chunk, isLast) => {
+              if (targetWs.readyState !== 1) return;
+              if (chunk) {
+                targetWs.send(JSON.stringify({
+                  type: 'audio',
+                  from: client.session.sessionId,
+                  lang: peerTarget,
+                  codec: 'pcm_s16le',
+                  sampleRate: 48000,
+                  chunkSeq: seq++,
+                  last: false,
+                  hasBinary: true,
+                  utteranceId,
+                }));
+                targetWs.send(chunk, { binary: true });
+              } else if (isLast) {
+                targetWs.send(JSON.stringify({
+                  type: 'audio',
+                  from: client.session.sessionId,
+                  lang: peerTarget,
+                  codec: 'pcm_s16le',
+                  sampleRate: 48000,
+                  last: true,
+                  endOfUtterance: true,
+                  hasBinary: false,
+                  utteranceId,
+                }));
+              }
+            });
+          } catch (e) {
+            log.warn(`[tts-fallback] error: ${e.message}`);
+          }
+        }
+      }, 500);
+    }
+  }
+
   // Peer captions: route to those who want them.
   for (const peer of others(client.room.code, client.session.sessionId)) {
     if (peer.ws?.readyState !== 1) continue;
@@ -1096,7 +1246,7 @@ export function startServer() {
   server.listen(config.port, () => {
     log.info(`ollalink-translate relay listening on http://localhost:${config.port}`);
     log.info(`ws endpoint: ${config.publicBase}/call`);
-    log.info(`upstream ollalink: ${config.ollalinkWsUrl} (key ending â€¦${config.ollalinkKey.slice(-6)})`);
+    log.info(`upstream ollalink: ${config.ollalinkWsUrl} (key ending …${config.ollalinkKey.slice(-6)})`);
   });
   return {
     async close() {
@@ -1119,7 +1269,7 @@ if (isMain) {
   startRoomSweeper();
 }
 
-// In tests, `startServer` is invoked directly â€” `startRoomSweeper` is exported
+// In tests, `startServer` is invoked directly — `startRoomSweeper` is exported
 // so the test driver controls whether the sweeper runs. This keeps test
 // processes from hanging on a long-lived interval.
 
@@ -1146,3 +1296,4 @@ const handleSignal = async (signal) => {
 };
 process.on('SIGTERM', () => handleSignal('SIGTERM'));
 process.on('SIGINT', () => handleSignal('SIGINT'));
+
