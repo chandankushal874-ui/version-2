@@ -163,7 +163,18 @@ function stopBrowserAudio() {
   lastPacketTime = 0;
   packetArrivalIntervals = [];
   lastSpeechTime = 0;
-  }
+}
+
+export function clearBrowserPlayback() {
+  browserPlaybackGen++;
+  audioPlayQueue = Promise.resolve();
+  nextPlayTime = 0;
+  pendingAudioMetaQueue = [];
+  pendingBinaryQueue = [];
+  outboundAudioQueue = [];
+  outboundPacingActive = false;
+  browserSeenAudioChunks.clear();
+}
 
 /**
  * High-Precision Inbound Audio Playback with Jitter Smoothing.
@@ -593,6 +604,10 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
             if (typeof e.data === 'string') {
               try {
                 const msg = JSON.parse(e.data);
+                if (msg.type === 'audio.clear') {
+                  clearBrowserPlayback();
+                  return;
+                }
                 if (msg.type === 'audio') {
                   // C3 Fix: Robust dedup — only dedup when utteranceId is a non-empty string (not null/undefined/"undefined")
                   if (typeof msg.utteranceId === 'string' && msg.utteranceId.length > 0 && msg.utteranceId !== 'undefined' && msg.chunkSeq !== undefined) {
@@ -777,6 +792,7 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     }
 
     case 'change_languages': {
+      clearBrowserPlayback();
       if (browserWs && browserWs.readyState === WebSocket.OPEN) {
         browserWs.send(JSON.stringify({
           type: 'lang.change',

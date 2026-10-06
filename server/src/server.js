@@ -508,6 +508,19 @@ wss.on('connection', (ws, req) => {
         if (client._flushTimer) { clearInterval(client._flushTimer); client._flushTimer = null; }
         client._handledUtterances?.clear();
 
+        // Clear audio queues for all peers in the room so old language speech never bleeds
+        for (const [sid, p] of client.room.participants) {
+          const pClient = clientRegistry.get(p.ws);
+          if (pClient) {
+            pClient.reconnectBuffer = [];
+            if (pClient._flushTimer) { clearInterval(pClient._flushTimer); pClient._flushTimer = null; }
+            pClient._handledUtterances?.clear();
+          }
+        }
+        // Broadcast audio.clear to all participants to instantly purge playback buffers
+        broadcastToOthers(client, { type: 'audio.clear' });
+        try { ws.send(JSON.stringify({ type: 'audio.clear' })); } catch { /* ignore */ }
+
         // Re-open THIS participant's upstream with the new multi-target set.
         try { client.upstream?.close(); } catch { /* ignore */ }
         const newTargets = computeTargets(client.room, client.session.sessionId, tgt);
@@ -606,8 +619,8 @@ wss.on('connection', (ws, req) => {
     // Keep buffering beyond 3 frames (drop-oldest, bounded to 12 frames = 6.0s max) until session.ready.
     if (!client.upstream?.isOpen() || !client.upstream?.isConfigured?.()) {
       if (!client.reconnectBuffer) client.reconnectBuffer = [];
-      if (client.reconnectBuffer.length >= 12) {
-        client.reconnectBuffer.shift(); // drop oldest to cap latency at 6s
+      if (client.reconnectBuffer.length >= 4) {
+        client.reconnectBuffer.shift(); // drop oldest to cap latency at ~640ms
       }
       client.reconnectBuffer.push(data);
       return;
@@ -617,7 +630,7 @@ wss.on('connection', (ws, req) => {
     // Never flush back-to-back synchronously, which triggers 4029 overloaded error from Ollalink!
     if (client.reconnectBuffer?.length > 0 || client._flushTimer) {
       if (!client.reconnectBuffer) client.reconnectBuffer = [];
-      if (client.reconnectBuffer.length >= 12) {
+      if (client.reconnectBuffer.length >= 4) {
         client.reconnectBuffer.shift();
       }
       client.reconnectBuffer.push(data);
@@ -711,7 +724,7 @@ function paceFlushReconnectBuffer(client) {
 
   flushNext();
   if (client.reconnectBuffer && client.reconnectBuffer.length > 0) {
-    client._flushTimer = setInterval(flushNext, 500);
+    client._flushTimer = setInterval(flushNext, 160);
   }
 }
 
@@ -1010,11 +1023,14 @@ export function forwardOllalinkToRoom(client, evt) {
       if (!targetWs || targetWs === client.ws || targetWs.readyState !== 1) continue;
       
       // Check target language match using canonical language mapping.
-      const pCanon = canonicalLang(p.language);
+      const pLang = p.language || p.target || '';
+      const pCanon = canonicalLang(pLang);
       const peerCanon = canonicalLang(peer.targetLang);
       if (pCanon && peerCanon) {
         if (pCanon !== peerCanon) continue;
-      } else if (!pCanon) {
+      } else if (!pCanon && peerCanon) {
+        // If audio event was not tagged with target language, and peers have different target languages,
+        // log warning once per client.
         if (!client._warnedMissingAudioLang) {
           client._warnedMissingAudioLang = true;
           log.warn(`[DOWNLINK AUDIO] upstream audio event missing language field (payload keys: ${Object.keys(p).join(',')}); forwarding to room peers`);
@@ -1022,10 +1038,9 @@ export function forwardOllalinkToRoom(client, evt) {
       }
 
       // Sample rate guarantee:
-      // Multilingual target languages (es, fr, zh, de, ar, pt, ru, kn) run at 24000 Hz.
+      // Streaming PCM is natively 48000 Hz across all targets; batch WAV is 24000 Hz.
       const finalCodec = p.codec || 'pcm_s16le';
-      const isMultilingualVoice = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn'].includes(peerCanon || pCanon);
-      const defaultRate = (finalCodec === 'wav' || isMultilingualVoice) ? 24000 : 48000;
+      const defaultRate = finalCodec === 'wav' ? 24000 : 48000;
       const finalRate = p.sampleRate || p.sample_rate || defaultRate;
 
       try {
@@ -1200,7 +1215,7 @@ export function forwardOllalinkToRoom(client, evt) {
     // Translations target a specific language; only send the matching one.
     // L6 Fix: Use base-language match (hi-IN matches hi) like audio routing does.
     if (evt.kind === 'translation' || evt.kind === 'translation-delta') {
-      const t = evt.payload?.language ?? evt.payload?.lang;
+      const t = evt.payload?.language ?? evt.payload?.lang ?? evt.payload?.target;
       if (t && peer.targetLang) {
         const tCanon = canonicalLang(t);
         const peerCanon = canonicalLang(peer.targetLang);

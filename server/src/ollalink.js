@@ -133,10 +133,19 @@ export function translateEvent(raw) {
     case 'partial':            return { kind: 'caption-partial', payload: parsed };
     case 'transcript.final':
     case 'final':              return { kind: 'caption-final',   payload: parsed };
-    case 'translation.started':return { kind: 'translation-started', payload: parsed };
-    case 'translation.delta':  return { kind: 'translation-delta',   payload: parsed };
+    case 'translation.started':
+    case 'translation.delta':
     case 'translation.final':
-    case 'translation':        return { kind: 'translation',     payload: parsed };
+    case 'translation': {
+      if (parsed) {
+        if (!parsed.language && parsed.target) parsed.language = parsed.target;
+        if (!parsed.lang && parsed.target) parsed.lang = parsed.target;
+        if (!parsed.target && (parsed.language || parsed.lang)) parsed.target = parsed.language || parsed.lang;
+      }
+      if (t === 'translation.started') return { kind: 'translation-started', payload: parsed };
+      if (t === 'translation.delta') return { kind: 'translation-delta', payload: parsed };
+      return { kind: 'translation', payload: parsed };
+    }
     case 'speech.started':     return { kind: 'speech-started',  payload: parsed };
     case 'speech.ended':       return { kind: 'speech-ended',    payload: parsed };
     case 'translation.audio': {
@@ -151,11 +160,11 @@ export function translateEvent(raw) {
         const r = pcm.readUInt32LE(24);
         if (r > 0) detectedWavRate = r;
       }
-      const rawLang = parsed.language ?? parsed.lang ?? '';
+      const rawLang = parsed.target ?? parsed.language ?? parsed.lang ?? '';
       const langCanon = canonicalLang(rawLang);
       const isWav = detectedWavRate || (parsed.codec && parsed.codec.toLowerCase() === 'wav');
-      const isMultilingualVoice = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn'].includes(langCanon);
-      const defaultRate = (isWav || isMultilingualVoice) ? 24000 : 48000; // Streaming PCM lane is 48kHz; batch WAV or multilingual fallback lane is 24kHz
+      // Streaming PCM lane is 48kHz for all targets; batch WAV lane (kn, ta, te) is 24kHz
+      const defaultRate = isWav ? 24000 : 48000;
       const codec = isWav ? 'wav' : (parsed.codec ?? 'pcm_s16le');
       const sampleRate = detectedWavRate ?? parsed.sample_rate ?? parsed.sampleRate ?? defaultRate;
 
@@ -167,7 +176,8 @@ export function translateEvent(raw) {
           sampleRate,
           explicitCodec: !!(detectedWavRate || parsed.codec),
           explicitSampleRate: !!(detectedWavRate || parsed.sample_rate || parsed.sampleRate),
-          language: parsed.language ?? parsed.lang ?? '',
+          language: langCanon || rawLang,
+          target: rawLang,
           chunkSeq: parsed.chunk_seq ?? 0,
           last: parsed.last === true,
           utteranceId: parsed.utterance_id,

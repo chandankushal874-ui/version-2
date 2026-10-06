@@ -111,14 +111,14 @@ function openWs(ws) {
   return new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
 }
 
-function waitForType(ws, type, timeoutMs = 2000) {
+function waitForType(ws, type, timeoutMs = 2000, filter = null) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs);
     const handler = (data, isBinary) => {
       if (isBinary) return;
       try {
         const msg = JSON.parse(data.toString());
-        if (msg.type === type) {
+        if (msg.type === type && (!filter || filter(msg))) {
           clearTimeout(t); ws.off('message', handler); resolve(msg);
         }
       } catch {}
@@ -290,7 +290,7 @@ test('back-to-back audio chunks preserve order', async () => {
 
 test('error event from upstream becomes caption kind=error', async () => {
   const alice = await joinCall('alice', 'en', 'hi');
-  const p = waitForType(alice.ws, 'caption');
+  const p = waitForType(alice.ws, 'caption', 2000, (m) => m.kind === 'error');
   alice.fake.ws.send(JSON.stringify({ type: 'error', code: 'test_error' }));
   const cap = await p;
   assert.equal(cap.kind, 'error');

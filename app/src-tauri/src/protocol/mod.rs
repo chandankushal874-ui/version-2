@@ -45,6 +45,8 @@ pub enum ServerEvent {
         from: String,
         payload: serde_json::Value,
     },
+    #[serde(rename = "audio.clear")]
+    AudioClear,
     Error { code: String, message: String },
     Pong { ts: u64 },
     #[serde(other)]

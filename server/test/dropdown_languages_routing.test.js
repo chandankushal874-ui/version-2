@@ -9,7 +9,7 @@ process.env.OLLALINK_WS_URL = 'ws://127.0.0.1:35201/v1/speech/stream';
 process.env.SESSION_SECRET = 'a'.repeat(64);
 process.env.LOG_LEVEL = 'error';
 
-const { normalizeLang, canonicalLang } = await import('../src/langs.js');
+const { normalizeLang } = await import('../src/langs.js');
 const { translateEvent } = await import('../src/ollalink.js');
 
 test('langs.js: dropdown language variations normalize to canonical targets', () => {
@@ -32,21 +32,33 @@ test('langs.js: dropdown language variations normalize to canonical targets', ()
 
   for (const c of cases) {
     const norm = normalizeLang(c.in, 'target');
-    assert.equal(norm, c.exp, `Language '${c.in}' should normalize to '${c.exp}', got '${norm}'`);
+    assert.equal(norm, c.exp);
   }
 });
 
-test('ollalink.js: multilingual targets guarantee 24 kHz to eliminate chipmunks', () => {
-  const multilingualLangs = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn'];
+test('ollalink.js: streaming PCM lane defaults to 48 kHz and batch WAV defaults to 24 kHz', () => {
+  const multilingualLangs = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn', 'hi', 'en'];
   for (const lang of multilingualLangs) {
-    const evt = translateEvent(JSON.stringify({
+    // 1. Streaming PCM lane defaults to 48000 Hz
+    const evtPcm = translateEvent(JSON.stringify({
       type: 'translation.audio',
       audio_b64: Buffer.from([0, 0, 10, 0]).toString('base64'),
-      language: lang,
+      target: lang,
       chunk_seq: 1,
     }));
+    assert.equal(evtPcm.kind, 'audio');
+    assert.equal(evtPcm.payload.sampleRate, 48000);
+    assert.equal(evtPcm.payload.language, lang);
 
-    assert.equal(evt.kind, 'audio');
-    assert.equal(evt.payload.sampleRate, 24000, `Target '${lang}' must default to 24000 Hz, got ${evt.payload.sampleRate}`);
+    // 2. Batch WAV lane defaults to 24000 Hz
+    const evtWav = translateEvent(JSON.stringify({
+      type: 'translation.audio',
+      codec: 'wav',
+      audio_b64: Buffer.from([0, 0, 10, 0]).toString('base64'),
+      target: lang,
+      chunk_seq: 1,
+    }));
+    assert.equal(evtWav.kind, 'audio');
+    assert.equal(evtWav.payload.sampleRate, 24000);
   }
 });
