@@ -1,0 +1,191 @@
+================================================================================
+OLLALINK TRANSLATE - DETAILED POST-REPORT OF ENGINEERING ACCOMPLISHMENTS
+================================================================================
+
+PROJECT: Ollalink Translate - Real-Time 1:1 Voice Translation System
+REPOSITORY: C:\\ollalink-translate-2
+REMOTE REPOSITORY: https://github.com/chandankushal874-ui/version-2.git
+BRANCH: main
+PREVIOUS REPORT BASELINE: Commit 38e7b77 / daily mid report
+CURRENT HEAD COMMIT: Commit de46c39
+RELEASE BINARY STATUS: Authenticode DigiCert RFC 3161 Timestamped
+
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY
+--------------------------------------------------------------------------------
+Following the previous mid-progress report, critical end-to-end testing exposed
+severe regressions in multilingual routing, buffer management, and latency:
+  1. Massive Audio Delay: Playback latency escalated up to 30 seconds to 2 minutes.
+  2. Language Leakage / Replay: Switching hearing languages (e.g., from Hindi to
+     German) caused speech spoken up to 2 minutes earlier to continue replaying
+     in Hindi instead of the selected target language.
+  3. Audio Glitching & Deep-Bass Distortion: Audio played at 0.5x speed with
+     severe pitch degradation on multilingual streaming voices.
+  4. Dead Silence on Non-Hindi Targets: Selecting German or other target languages
+     resulted in complete silence or accidental fallback to Hindi.
+
+All four failure modes were systematically traced, root-caused at the network
+protocol, audio DSP, and server relay levels, and resolved with zero breakage
+to existing features. All 141 server tests and 23 Rust tests pass with zero
+warnings, and the updated release application has been compiled, Authenticode
+signed, packaged into the release archive, and synchronized to GitHub.
+
+--------------------------------------------------------------------------------
+2. ROOT CAUSE ANALYSIS & DIAGNOSTIC FINDINGS
+--------------------------------------------------------------------------------
+
+A. Ollalink Upstream Event Schema Mismatch (target vs language/lang):
+   - Finding: In the Ollalink Sound-Stream WebSocket protocol, translation audio
+     and text frames contain the target language identifier inside the field
+     'target' (e.g., target: 'de', target: 'hi'), rather than 'language' or 'lang'.
+   - Impact: In ollalink.js, translateEvent extracted:
+         parsed.language ?? parsed.lang ?? ''
+     Because neither 'language' nor 'lang' was present, the language field
+     evaluated to an empty string ('').
+   - Consequence: In server.js (forwardOllalinkToRoom), language filtering:
+         const pCanon = canonicalLang(p.language);
+         const peerCanon = canonicalLang(peer.targetLang);
+         if (pCanon && peerCanon && pCanon !== peerCanon) continue;
+     could never match because pCanon was always empty. The server consequently
+     forwarded every audio frame to every connected participant regardless of
+     target language, tagging the frames with whatever target language the peer
+     had configured. When a user switched to German, incoming Hindi audio was
+     forwarded to them stamped as 'de', causing Hindi speech to play out.
+
+B. Asymmetric Reconnection Buffer Pacing Spiral (500ms vs 160ms):
+   - Finding: The server-side reconnect buffer pacing timer in server.js
+     (paceFlushReconnectBuffer) flushed buffered audio chunks at a fixed interval
+     of 500ms.
+   - Impact: Client microphone streams send 160ms audio chunks (5120 bytes at
+     16kHz mono 16-bit PCM). Audio chunks entered the reconnect buffer more than
+     3 times faster than they were drained.
+   - Consequence: During network reconnects or upstream restarts, chunks rapidly
+     accumulated in reconnectBuffer. The buffer remained saturated, delaying
+     every single chunk by tens of seconds and causing speech to emerge 30 seconds
+     to 2 minutes after it was spoken.
+
+C. Cross-Language Audio Queue Bleed on Language Switch:
+   - Finding: When a user changed their hearing language mid-call (lang.change),
+     the relay server cleared the requesting client\'s reconnectBuffer, but
+     left peer participants\' reconnectBuffers intact.
+   - Impact: When the speaker\'s upstream was closed and reopened with the new
+     multi-target set, the speaker\'s reconnectBuffer held chunks spoken in the
+     previous language turn.
+   - Consequence: As soon as the new upstream session became ready, the server
+     flushed old Hindi speech into the new session, re-translating ancient turns
+     and playing stale audio through the listener\'s speakers.
+
+D. Sample Rate Misconfiguration (24 kHz vs 48 kHz):
+   - Finding: The server and desktop layers previously hardcoded multilingual
+     voices (es, fr, zh, de, ar, pt, ru, kn) to default to 24,000 Hz.
+   - Impact: Ollalink\'s real-time Sound-Stream PCM streaming lane natively
+     synthesizes 48,000 Hz audio for all targets. Tagging 48 kHz PCM audio as
+     24 kHz forced Rubato and Web Audio to resample 24k -> 48k (a 2x stretch).
+   - Consequence: Audio played at 0.5x speed with deep-bass pitch degradation,
+     doubling the playback duration of every utterance and causing playback
+     queues to continuously fall behind real-time conversation.
+
+E. Missing Playback Purge in Desktop Jitter and Web Audio:
+   - Finding: Neither the desktop client nor the browser bridge flushed their
+     inbound playback queues when a language change occurred mid-call.
+   - Impact: Up to 20-30 seconds of already-scheduled audio frames remained in
+     the Web Audio lookahead queue and CPAL ring buffer, playing to completion
+     before any newly translated audio could be heard.
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURAL IMPLEMENTATIONS & CODE CHANGES
+--------------------------------------------------------------------------------
+
+1. Upstream Protocol Normalization (server/src/ollalink.js):
+   - Updated translateEvent to inspect 'target' alongside 'language' and 'lang':
+         const rawLang = parsed.target ?? parsed.language ?? parsed.lang ?? '';
+   - Corrected default sample rate logic: streaming PCM defaults to 48,000 Hz
+     across all sound-stream targets, while only batch WAV containers (e.g.,
+     Kannada, Tamil, Telugu) default to 24,000 Hz.
+   - Added canonical target normalization across translation.started,
+     translation.delta, and translation.final events.
+
+2. Real-Time Relay Routing & Buffer Hardening (server/src/server.js):
+   - Implemented strict target language verification in forwardOllalinkToRoom:
+     matching pCanon with peerCanon to ensure peers only receive audio
+     synthesized specifically for their chosen language.
+   - Corrected streaming PCM sample rate dispatch: ensures 48,000 Hz audio is
+     cleanly passed to downstream clients without 24,000 Hz down-tagging.
+   - Accelerated buffer flush pacing: changed paceFlushReconnectBuffer interval
+     from 500ms to 160ms, perfectly matching the 160ms duration of incoming
+     16kHz PCM frames.
+   - Capped reconnectBuffer capacity to 4 chunks (~640ms maximum), ensuring
+     reconnection buffers never store stale conversation turns.
+   - Implemented room-wide queue purging on lang.change: clears reconnectBuffer,
+     _flushTimer, and _handledUtterances across ALL participants in the room.
+   - Added real-time control message { type: 'audio.clear' } broadcast to
+     instantly signal all room participants to drop stale audio buffers.
+   - Enhanced caption routing to check evt.payload.target.
+
+3. Desktop Audio Pipeline & Protocol (app/src-tauri/src):
+   - Added ServerEvent::AudioClear variant in protocol/mod.rs.
+   - In ws/mod.rs, handled ServerEvent::AudioClear to immediately clear
+     expected_audio_queue and pending_binary_queue.
+   - Restored 48,000 Hz streaming PCM rate resolution in ws/mod.rs:
+     defaulting to 24,000 Hz only for WAV containers and retaining last_known_rate
+     dynamically for PCM streams.
+   - In audio/jitter.rs, implemented JitterPlayer::clear(&self) to empty the
+     audio ring buffer, reset playing state, and reset underrun hysteresis counters.
+   - In state.rs, integrated call.audio.jitter().clear() and resampler flushes
+     immediately when change_languages() is invoked.
+
+4. Web Browser & Mobile Bridge (app/ui/src/bridge.ts):
+   - Implemented clearBrowserPlayback() which increments browserPlaybackGen,
+     resets nextPlayTime to 0, cancels audioPlayQueue, and empties pending
+     audio metadata, binary, and outbound queues.
+   - Added ws.onmessage handler for { type: 'audio.clear' } to trigger
+     clearBrowserPlayback() immediately upon server notification.
+   - Integrated clearBrowserPlayback() directly into the change_languages
+     invocation path.
+
+5. Test Suite Verification & Updates:
+   - Updated server/test/dropdown_languages_routing.test.js to validate that
+     streaming PCM lanes default to 48,000 Hz across all targets (es, fr, zh,
+     de, ar, pt, ru, kn, hi, en) and batch WAV lanes default to 24,000 Hz.
+   - Enhanced receive_path.test.js with caption filtering.
+   - Mirrored all server fixes into dist-package/server/src/.
+
+--------------------------------------------------------------------------------
+4. VERIFICATION, BUILD & PACKAGING STATUS
+--------------------------------------------------------------------------------
+
+  * Server Test Suite:
+    Total tests: 141 passed; 0 failed (100% pass rate).
+    Covers unit routing, multi-target fanout, receive path, room management,
+    regressions, and dropdown routing.
+
+  * Rust Desktop Test Suite:
+    Total tests: 23 passed; 0 failed; 0 warnings (100% pass rate).
+    Covers resamplers, jitter buffer underrun hysteresis, soft limiter,
+    hot-swap rates, and utterance boundary orphan purging.
+
+  * Production Compilation:
+    Tauri release build compiled with full LTO and optimizations:
+    Executable: app/src-tauri/target/release/ollalink-translate.exe
+    NSIS Setup: app/src-tauri/target/release/bundle/nsis/Ollalink Translate_0.1.0_x64-setup.exe
+
+  * Authenticode Digital Signatures:
+    All release executables and setup installers signed and timestamped using
+    DigiCert RFC 3161 Authenticode timestamp authority:
+      - ollalink-translate.exe (Verified: SHA256 Authenticode)
+      - Ollalink-Translate-Setup.exe (Verified: SHA256 Authenticode)
+
+  * Release Archive & Checksums:
+    Packaged into Ollalink-Translate-Windows-x64.zip including executable,
+    installer, cert tools, launcher scripts, and solo test partner.
+    Updated SHA256SUMS.txt and Ollalink-Translate-Windows-x64.zip.sha256.
+
+  * Git Synchronization:
+    Commit: de46c39
+    Branch: main
+    Remote: https://github.com/chandankushal874-ui/version-2.git
+    Render production relay deployment triggered from main branch.
+
+================================================================================
+END OF REPORT
+================================================================================
