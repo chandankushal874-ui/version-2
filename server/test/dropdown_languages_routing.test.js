@@ -36,9 +36,9 @@ test('langs.js: dropdown language variations normalize to canonical targets', ()
   }
 });
 
-test('ollalink.js: multilingual targets guarantee 24 kHz to eliminate chipmunks', () => {
-  const multilingualLangs = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn'];
-  for (const lang of multilingualLangs) {
+test('ollalink.js: streaming PCM lane defaults to 48 kHz for all targets when sample_rate omitted', () => {
+  const allLangs = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn', 'en', 'hi'];
+  for (const lang of allLangs) {
     const evt = translateEvent(JSON.stringify({
       type: 'translation.audio',
       audio_b64: Buffer.from([0, 0, 10, 0]).toString('base64'),
@@ -47,6 +47,6 @@ test('ollalink.js: multilingual targets guarantee 24 kHz to eliminate chipmunks'
     }));
 
     assert.equal(evt.kind, 'audio');
-    assert.equal(evt.payload.sampleRate, 24000, `Target '${lang}' must default to 24000 Hz, got ${evt.payload.sampleRate}`);
+    assert.equal(evt.payload.sampleRate, 48000, `Streaming target '${lang}' must default to 48000 Hz, got ${evt.payload.sampleRate}`);
   }
 });

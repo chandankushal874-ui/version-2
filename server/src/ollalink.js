@@ -154,8 +154,7 @@ export function translateEvent(raw) {
       const rawLang = parsed.language ?? parsed.lang ?? '';
       const langCanon = canonicalLang(rawLang);
       const isWav = detectedWavRate || (parsed.codec && parsed.codec.toLowerCase() === 'wav');
-      const isMultilingualVoice = ['es', 'fr', 'zh', 'de', 'ar', 'pt', 'ru', 'kn'].includes(langCanon);
-      const defaultRate = (isWav || isMultilingualVoice) ? 24000 : 48000; // Streaming PCM lane is 48kHz; batch WAV or multilingual fallback lane is 24kHz
+      const defaultRate = isWav ? 24000 : 48000; // Streaming PCM lane is 48kHz; batch WAV lane is 24kHz
       const codec = isWav ? 'wav' : (parsed.codec ?? 'pcm_s16le');
       const sampleRate = detectedWavRate ?? parsed.sample_rate ?? parsed.sampleRate ?? defaultRate;
 
