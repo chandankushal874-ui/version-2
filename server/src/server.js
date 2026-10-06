@@ -24,7 +24,6 @@
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { config, log } from './config.js';
-import { translateText, synthesizeSpeech } from './tts-fallback.js';
 import { mintSession, verifySession } from './auth.js';
 import { createRoom, getRoom, joinRoom, leaveRoom, others, roomStats, isValidRoomCode, startRoomSweeper } from './rooms.js';
 import { openOllalinkStream, probeOllalinkLanguage } from './ollalink.js';
@@ -499,10 +498,21 @@ wss.on('connection', (ws, req) => {
         if (src === client.session.sourceLang && tgt === client.session.targetLang) {
           return; // No-op
         }
-        const oldTgt = client.session.targetLang;
+                const oldTgt = client.session.targetLang;
         client.session.sourceLang = src;
         client.session.targetLang = tgt;
-        log.info(`${client.session.userId} changed langs ${src} → ${tgt}`);
+        if (msg.voice) client.session.voice = normalizeVoice(msg.voice);
+        if (msg.tone) client.session.tone = normalizeTone(msg.tone);
+        if (msg.token) client.session.token = msg.token;
+
+        const part = client.room.participants.get(client.session.sessionId);
+        if (part) {
+          part.sourceLang = src;
+          part.targetLang = tgt;
+          part.voice = client.session.voice;
+          part.tone = client.session.tone;
+        }
+        log.info(`${client.session.userId} changed langs ${src} -> ${tgt} (voice=${client.session.voice} tone=${client.session.tone})`);
 
         client.reconnectBuffer = [];
         if (client._flushTimer) { clearInterval(client._flushTimer); client._flushTimer = null; }
@@ -521,14 +531,9 @@ wss.on('connection', (ws, req) => {
         broadcastToOthers(client, { type: 'audio.clear' });
         try { ws.send(JSON.stringify({ type: 'audio.clear' })); } catch { /* ignore */ }
 
-        // Re-open THIS participant's upstream with the new multi-target set.
+        // Re-open THIS participant's upstream with the new multi-target set and appropriate voice/tone.
         try { client.upstream?.close(); } catch { /* ignore */ }
         const newTargets = computeTargets(client.room, client.session.sessionId, tgt);
-        if (msg.voice) client.session.voice = normalizeVoice(msg.voice);
-        if (msg.tone) client.session.tone = normalizeTone(msg.tone);
-        if (msg.token) client.session.token = msg.token;
-        client.reconnectAttempts = 0; // M6 Fix: User-initiated operation resets reconnect retry counter
-
         client.upstream = bindUpstream(client,
           {
             sourceLang: src,
@@ -545,8 +550,7 @@ wss.on('connection', (ws, req) => {
           },
         );
 
-        // If this participant's targetLang changed, OTHER speakers' upstreams
-        // need to include the new target. Re-open only if targets changed (Bug 10 Fix).
+        // Update other participants' upstreams so their speech translates to client's new target & voice
         if (oldTgt !== tgt) {
           for (const [sid, p] of client.room.participants) {
             if (sid === client.session.sessionId) continue;
@@ -570,15 +574,21 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-    if (msg.type === 'update-voice-settings') {
+          if (msg.type === 'update-voice-settings') {
         if (!client.session || !client.room) return sendErr(ws, 'not-joined', 'not in a call');
         const newVoice = normalizeVoice(msg.voice || client.session.voice);
         const newTone = normalizeTone(msg.tone || client.session.tone);
         if (newVoice === client.session.voice && newTone === client.session.tone && client.upstream?.isOpen()) {
           return;
         }
+        
         client.session.voice = newVoice;
         client.session.tone = newTone;
+        const part = client.room.participants.get(client.session.sessionId);
+        if (part) {
+          part.voice = newVoice;
+          part.tone = newTone;
+        }
         client.reconnectAttempts = 0; // M6 Fix: User-initiated operation resets reconnect retry counter
 
         // Re-open upstream Ollalink stream with the updated voice and tone
@@ -601,6 +611,7 @@ wss.on('connection', (ws, req) => {
             onError: (err) => sendErr(client.ws, 'upstream-error', err.message),
           }
         );
+
         log.info(`voice settings updated for ${client.session.displayName}: voice=${newVoice} tone=${newTone}`);
         ws.send(JSON.stringify({ type: 'voice.settings.updated', voice: newVoice, tone: newTone }));
         broadcastToOthers(client, {
@@ -611,7 +622,6 @@ wss.on('connection', (ws, req) => {
         });
         return;
       }
-
       return; // unknown JSON frame; ignore
     }
 
@@ -1008,19 +1018,15 @@ export function forwardOllalinkToRoom(client, evt) {
     const marker = p.last === true && !p.pcm;
     if (p.utteranceId) recordHandledUtterance(client, p.utteranceId);
 
-    const peers = Array.from(others(client.room.code, client.session.sessionId));
-    // Self-monitor audio return is disabled when alone (prevents acoustic feedback loop and self-echo)
-    if (peers.length === 0) {
-      return;
-    }
+        const peers = Array.from(others(client.room.code, client.session.sessionId));
+    if (peers.length === 0) return;
 
     for (const peer of peers) {
       const targetWs = peer.ws;
       // H5 Fix: Skip replaced/closing connections to prevent ghost audio on reconnect
       const peerClient = targetWs ? clientRegistry.get(targetWs) : null;
       if (peerClient?._replacedByNewConnection) continue;
-      // Do not send if target is missing, not ready, or pointing to client (speaker)
-      if (!targetWs || targetWs === client.ws || targetWs.readyState !== 1) continue;
+      if (!targetWs || targetWs.readyState !== 1) continue;
       
       // Check target language match using canonical language mapping.
       const pLang = p.language || p.target || '';
@@ -1029,8 +1035,6 @@ export function forwardOllalinkToRoom(client, evt) {
       if (pCanon && peerCanon) {
         if (pCanon !== peerCanon) continue;
       } else if (!pCanon && peerCanon) {
-        // If audio event was not tagged with target language, and peers have different target languages,
-        // log warning once per client.
         if (!client._warnedMissingAudioLang) {
           client._warnedMissingAudioLang = true;
           log.warn(`[DOWNLINK AUDIO] upstream audio event missing language field (payload keys: ${Object.keys(p).join(',')}); forwarding to room peers`);
@@ -1070,150 +1074,11 @@ export function forwardOllalinkToRoom(client, evt) {
     payload: evt.payload,
   });
 
-  // Fallback Neural Translation & TTS Engine:
-  // When Ollalink chat-translation fails or reports TranslationUnavailable,
-  // automatically translate and synthesize 48kHz native voice for peers.
-  // Immediate synthesis on translation_error
-  if (evt.kind === 'error' && evt.payload?.code === 'translation_error') {
-    const utteranceId = evt.payload?.utterance_id || client._lastFinalUtteranceId;
-    const textToSpeak = client._lastFinalTranscript;
-    if (utteranceId && textToSpeak && !client._handledUtterances?.has(utteranceId)) {
-      recordHandledUtterance(client, utteranceId);
-      const peers = Array.from(others(client.room?.code, client.session?.sessionId));
-      for (const peer of peers) {
-        const targetWs = peer.ws;
-        if (!targetWs || targetWs.readyState !== 1) continue;
-        const peerTarget = canonicalLang(peer.targetLang) || 'en';
-        (async () => {
-          try {
-            log.info(`[tts-fallback-immediate] synthesizing voice on error for ${client.session.displayName} -> ${peer.displayName} (${peerTarget})`);
-            const translated = await translateText(textToSpeak, peerTarget);
-            targetWs.send(JSON.stringify({
-              type: 'caption',
-              kind: 'translation',
-              from: client.session.sessionId,
-              payload: {
-                type: 'translation.final',
-                utterance_id: utteranceId,
-                text: translated,
-                target: peerTarget,
-              },
-            }));
-            let seq = 0;
-            await synthesizeSpeech(translated, peerTarget, peer.session.voice || 'default', (chunk, isLast) => {
-              if (targetWs.readyState !== 1) return;
-              if (chunk) {
-                targetWs.send(JSON.stringify({
-                  type: 'audio',
-                  from: client.session.sessionId,
-                  lang: peerTarget,
-                  codec: 'pcm_s16le',
-                  sampleRate: 48000,
-                  chunkSeq: seq++,
-                  last: false,
-                  hasBinary: true,
-                  utteranceId,
-                }));
-                targetWs.send(chunk, { binary: true });
-              } else if (isLast) {
-                targetWs.send(JSON.stringify({
-                  type: 'audio',
-                  from: client.session.sessionId,
-                  lang: peerTarget,
-                  codec: 'pcm_s16le',
-                  sampleRate: 48000,
-                  last: true,
-                  endOfUtterance: true,
-                  hasBinary: false,
-                  utteranceId,
-                }));
-              }
-            });
-          } catch (err) {
-            log.warn(`[tts-fallback-immediate] error: ${err.message}`);
-          }
-        })();
-      }
-    }
-  }
-
-  if (evt.kind === 'caption-final' && evt.payload?.text) {
-    const finalTranscript = evt.payload.text;
-    const utteranceId = evt.payload.utterance_id || ('u_' + Date.now());
-    client._lastFinalTranscript = finalTranscript;
-    client._lastFinalUtteranceId = utteranceId;
-    const peers = Array.from(others(client.room.code, client.session.sessionId));
-
-    if (peers.length > 0) {
-      setTimeout(async () => {
-        if (client._handledUtterances?.has(utteranceId)) return;
-        recordHandledUtterance(client, utteranceId);
-
-        for (const peer of peers) {
-          const targetWs = peer.ws;
-          if (!targetWs || targetWs.readyState !== 1) continue;
-          const peerTarget = canonicalLang(peer.targetLang) || 'en';
-
-          try {
-            log.info(`[tts-fallback] synthesizing voice for ${client.session.displayName} -> ${peer.displayName} (${peerTarget})`);
-            const translated = await translateText(finalTranscript, peerTarget);
-
-            targetWs.send(JSON.stringify({
-              type: 'caption',
-              kind: 'translation',
-              from: client.session.sessionId,
-              payload: {
-                type: 'translation.final',
-                utterance_id: utteranceId,
-                text: translated,
-                target: peerTarget,
-              },
-            }));
-
-            let seq = 0;
-            await synthesizeSpeech(translated, peerTarget, peer.session.voice || 'default', (chunk, isLast) => {
-              if (targetWs.readyState !== 1) return;
-              if (chunk) {
-                targetWs.send(JSON.stringify({
-                  type: 'audio',
-                  from: client.session.sessionId,
-                  lang: peerTarget,
-                  codec: 'pcm_s16le',
-                  sampleRate: 48000,
-                  chunkSeq: seq++,
-                  last: false,
-                  hasBinary: true,
-                  utteranceId,
-                }));
-                targetWs.send(chunk, { binary: true });
-              } else if (isLast) {
-                targetWs.send(JSON.stringify({
-                  type: 'audio',
-                  from: client.session.sessionId,
-                  lang: peerTarget,
-                  codec: 'pcm_s16le',
-                  sampleRate: 48000,
-                  last: true,
-                  endOfUtterance: true,
-                  hasBinary: false,
-                  utteranceId,
-                }));
-              }
-            });
-          } catch (e) {
-            log.warn(`[tts-fallback] error: ${e.message}`);
-          }
-        }
-      }, 500);
-    }
-  }
-
   // Peer captions: route to those who want them.
   for (const peer of others(client.room.code, client.session.sessionId)) {
     if (peer.ws?.readyState !== 1) continue;
     if (peer.captionsOn === false) continue;
     // Translations target a specific language; only send the matching one.
-    // L6 Fix: Use base-language match (hi-IN matches hi) like audio routing does.
     if (evt.kind === 'translation' || evt.kind === 'translation-delta') {
       const t = evt.payload?.language ?? evt.payload?.lang ?? evt.payload?.target;
       if (t && peer.targetLang) {

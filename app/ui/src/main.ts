@@ -1847,6 +1847,7 @@ async function main() {
         await controller.changeLanguages(lang, undefined);
 
         showVoiceUpdated(`${name} Active`);
+        if (outboundLangLabel) outboundLangLabel.textContent = `Speaking: ${name}`;
 
       } catch (e) {
 
@@ -1969,6 +1970,7 @@ async function main() {
         await controller.changeLanguages(undefined, lang);
 
         showVoiceUpdated(`${name} Lane Active`);
+        if (inboundLangLabel) inboundLangLabel.textContent = `Hearing: ${name}`;
 
       } catch (e) {
 
@@ -2320,131 +2322,17 @@ async function main() {
 
 
 
-  // --- Client-Side High-Reliability Receiver Voice Synthesis Fallback ---
-const clientHandledUtterances = new Set<string>();
+  // --- Receiver Utterance Tracking ---
+  const clientHandledUtterances = new Set<string>();
 
-function markUtteranceHandled(key: string) {
-  markUtteranceHandled(key);
-  if (clientHandledUtterances.size > 200) {
-    const first = clientHandledUtterances.values().next().value;
-    if (first) clientHandledUtterances.delete(first);
-  }
-}
-
-async function translateTextClient(text: string, targetLang: string): Promise<string> {
-  try {
-    const lang = (targetLang || 'en').split('-')[0].toLowerCase();
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(lang)}&dt=t&q=${encodeURIComponent(text)}`;
-    const res = await fetch(url);
-    if (res.ok) {
-      const json = await res.json();
-      if (json && json[0]) {
-        const trans = json[0].map((item: any) => item[0]).join('');
-        if (trans && trans.trim()) return trans.trim();
-      }
+  function markUtteranceHandled(key: string) {
+    if (!key) return;
+    clientHandledUtterances.add(key);
+    if (clientHandledUtterances.size > 200) {
+      const first = clientHandledUtterances.values().next().value;
+      if (first) clientHandledUtterances.delete(first);
     }
-  } catch {}
-  return text;
-}
-
-async function synthesizeAndPlayDirect(text: string, targetLangCode: string) {
-  if (!text || !text.trim()) return;
-  const lang = (targetLangCode || 'hi').split('-')[0].toLowerCase();
-  const voice = lang === 'hi' ? 'nh-m01' : (lang === 'en' ? 'nh-ot03' : 'default');
-
-  try {
-    const ws = new WebSocket('wss://sound-stream.ollalink.com/v1/tts/speak');
-    const timeout = setTimeout(() => {
-      try { ws.close(); } catch {}
-    }, 15000);
-
-    ws.onopen = () => {
-      ws.send(JSON.stringify({
-        type: 'session.configure',
-        api_key: 'sk_44935c9a9c2186a08697dd56ddc734cb165b94b060aebfd4',
-        voice,
-        language: lang,
-      }));
-    };
-
-    ws.onmessage = async (e) => {
-      if (typeof e.data === 'string') {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === 'session.ready') {
-            ws.send(JSON.stringify({ type: 'speak', text }));
-          } else if (msg.type === 'speak.done') {
-            clearTimeout(timeout);
-            await invoke('play_audio_chunk', { pcmBase64: '', sampleRate: 48000, isLast: true });
-            try { ws.close(); } catch {}
-          } else if (msg.type === 'error') {
-            clearTimeout(timeout);
-            try { ws.close(); } catch {}
-          }
-        } catch {}
-      } else if (e.data instanceof Blob) {
-        const buffer = await e.data.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        let binary = '';
-        const chunkSz = 8192;
-        for (let i = 0; i < bytes.length; i += chunkSz) {
-          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSz) as any);
-        }
-        const b64 = btoa(binary);
-        await invoke('play_audio_chunk', { pcmBase64: b64, sampleRate: 48000, isLast: false });
-      }
-    };
-
-    ws.onerror = () => {
-      clearTimeout(timeout);
-    };
-  } catch (err) {
-    console.warn('[direct tts fallback error]', err);
   }
-}
-
-let lastRemoteCaptionText = '';
-
-async function handleRemoteCaptionAudioFallback(ev: any) {
-  if (!ev || !ev.from || ev.from === selfSessionId) return;
-
-  const payload = ev.payload;
-  const isFinal = ev.kind === 'caption-final' || (payload?.type === 'transcript.final');
-  const isTrans = ev.kind === 'translation' || (payload?.type === 'translation.final');
-  const isErr = ev.kind === 'error' && (payload?.code === 'translation_error');
-
-  const utteranceId = payload?.utterance_id || payload?.utteranceId;
-  const text = payload?.text || lastRemoteCaptionText;
-  if (!utteranceId && !text) return;
-  const key = utteranceId || text;
-
-  if (payload?.text && isFinal) {
-    lastRemoteCaptionText = payload.text;
-  }
-
-  if (clientHandledUtterances.has(key)) return;
-
-  const myTarget = (targetLang?.value || 'hi').toLowerCase();
-
-  if (isErr) {
-    markUtteranceHandled(key);
-    if (text) {
-      const translated = await translateTextClient(text, myTarget);
-      await synthesizeAndPlayDirect(translated, myTarget);
-    }
-    return;
-  }
-
-  if (isFinal || isTrans) {
-    setTimeout(async () => {
-      if (clientHandledUtterances.has(key)) return;
-      markUtteranceHandled(key);
-      const textToSpeak = isTrans ? text : await translateTextClient(text, myTarget);
-      await synthesizeAndPlayDirect(textToSpeak, myTarget);
-    }, 700);
-  }
-}
-
 
   function handleRelayEvent(ev: any) {
 
@@ -2591,9 +2479,7 @@ async function handleRemoteCaptionAudioFallback(ev: any) {
             const senderDisplayName = participantNames.get(ev.from);
 
             captions.add(ev, senderDisplayName);
-            handleRemoteCaptionAudioFallback(ev);
-
-          } catch (e) {
+            } catch (e) {
 
             console.warn('caption failed:', e);
 

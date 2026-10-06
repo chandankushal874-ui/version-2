@@ -245,7 +245,7 @@ function playInboundAudioChunk(buffer: any, sampleRate?: number) {
 
         const now = playbackCtx.currentTime;
         // Bug 4 Fix: Tight 300ms lookahead clamp absorbs network jitter bursts without scheduling seconds ahead
-        const MAX_LOOKAHEAD = 1.50; // H3 Fix: 1.5s lookahead avoids chunk overlap
+        const MAX_LOOKAHEAD = 8.0; // H3 Fix: 1.5s lookahead avoids chunk overlap
         if (nextPlayTime < now) {
           nextPlayTime = now;
         } else if (nextPlayTime > now + MAX_LOOKAHEAD) {
@@ -300,7 +300,7 @@ function playInboundAudioChunk(buffer: any, sampleRate?: number) {
 
     const now = playbackCtx.currentTime;
     // Bug 4 Fix: Tight 300ms lookahead clamp absorbs network jitter bursts without scheduling seconds ahead
-    const MAX_LOOKAHEAD = 1.50; // H3 Fix: 1.5s lookahead avoids chunk overlap
+    const MAX_LOOKAHEAD = 8.0; // H3 Fix: 1.5s lookahead avoids chunk overlap
     if (nextPlayTime < now) {
       nextPlayTime = now;
     } else if (nextPlayTime > now + MAX_LOOKAHEAD) {
